@@ -108,3 +108,12 @@ def test_corrupt_history_is_rejected(tmp_path):
     store.current.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="incohérent"):
         store.load()
+
+
+def test_reference_search_reports_depth_limit_and_active_depth():
+    from santorini.search import search
+    progress = []
+    result = search(Position(), 5, publish=progress.append, max_depth=1)
+    assert result.stop_reason == "depth_limit"
+    assert result.depth == 1
+    assert any(p.searching_depth == 1 for p in progress)

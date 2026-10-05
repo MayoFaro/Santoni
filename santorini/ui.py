@@ -116,7 +116,7 @@ class BoardGrid(QTableWidget):
             text = f"{s.heights[cell]}" + (" • Dôme" if s.domes & (1 << cell) else "")
             if occupants:
                 p, i = occupants[0]
-                text += f"\n{'M' if p == 0 else 'R'}{i + 1}"
+                text += f"\n{'M' if p == 0 else getattr(self, 'opponent_tag', 'R')}{i + 1}"
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
             item.setToolTip(f"{coord(cell)} : niveau {s.heights[cell]}" + (", dôme" if s.domes & (1 << cell) else ""))
@@ -247,6 +247,9 @@ class MainWindow(QMainWindow):
         self.placement_generation = 0
         self.workers = {}
         self.retired = set()
+        self.correction_original = None
+        self.correction_index = None
+        self.correction_busy = False
         self.draft = ()
         self.options = []
         self.complete = None
@@ -283,9 +286,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs)
         self._configuration()
         self._game()
-        self.history = QTextEdit()
-        self.history.setReadOnly(True)
-        self.tabs.addTab(self.history, "Historique")
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        self.history_help = QLabel("Sélectionnez un tour complet, puis Corriger. Les tours suivants seront rejoués et vérifiés.")
+        self.history_help.setWordWrap(True)
+        history_layout.addWidget(self.history_help)
+        self.history = QListWidget()
+        self.history.currentRowChanged.connect(lambda *_: self.update_correction_controls())
+        history_layout.addWidget(self.history)
+        self.correct_button = button("Corriger le tour sélectionné", self.begin_correction)
+        history_layout.addWidget(self.correct_button)
+        self.tabs.addTab(history_page, "Historique")
         self.footer = QLabel("Sauvegarde automatique après chaque tour. Ctrl + molette : opacité.")
         self.footer.setWordWrap(True)
         layout.addWidget(self.footer)
@@ -296,6 +307,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(100)
         self.refresh_configuration()
+        self.mode_changed()
         self.refresh()
         if restore:
             self.footer.setText("Recherche d'une partie sauvegardée…")
@@ -304,6 +316,10 @@ class MainWindow(QMainWindow):
     def _configuration(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self.robot_game = QCheckBox("Partie contre robot")
+        self.robot_game.setChecked(False)
+        self.robot_game.toggled.connect(self.mode_changed)
+        layout.addWidget(self.robot_game)
         row = QHBoxLayout()
         self.families = {}
         for key, text in [("basic", "Dieux de base"), ("hero", "Pouvoirs de héros"), ("advanced", "Dieux avancés")]:
@@ -317,7 +333,7 @@ class MainWindow(QMainWindow):
         self.available.setMaximumHeight(125)
         self.available.itemChanged.connect(self.available_changed)
         layout.addWidget(self.available)
-        hint = QLabel("Cochez les cartes disponibles. Les pouvoirs grisés restent à implémenter.")
+        hint = QLabel("Choisissez une famille, puis cochez les deux cartes disponibles pour la partie. Les pouvoirs grisés restent à implémenter.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         form = QFormLayout()
@@ -325,7 +341,8 @@ class MainWindow(QMainWindow):
         self.mine.currentIndexChanged.connect(self.configuration_changed)
         self.robot.currentIndexChanged.connect(self.configuration_changed)
         form.addRow("Mon pouvoir", self.mine)
-        form.addRow("Pouvoir du robot", self.robot)
+        self.opponent_power_label = QLabel("Pouvoir de l’adversaire")
+        form.addRow(self.opponent_power_label, self.robot)
         self.first = QComboBox()
         self.first.addItems(["Moi", "Robot"])
         self.first.currentIndexChanged.connect(self.configuration_changed)
@@ -424,6 +441,9 @@ class MainWindow(QMainWindow):
         self.draft_text = QLabel()
         self.draft_text.setWordWrap(True)
         layout.addWidget(self.draft_text)
+        self.cancel_correction_button = button("Annuler la correction", self.cancel_correction)
+        self.cancel_correction_button.hide()
+        layout.addWidget(self.cancel_correction_button)
         row = QHBoxLayout()
         self.back = button("Annuler l'action", self.back_action)
         self.commit_button = button("Valider le tour / terminer", self.commit_draft, True)
@@ -480,6 +500,37 @@ class MainWindow(QMainWindow):
     def clear_error(self):
         self.error.hide()
 
+    def robot_mode(self):
+        session = self.correction_original or self.session
+        # Older saved games predate the choice and were played against the robot.
+        return session.settings.get("robot_mode", True) if session else self.robot_game.isChecked()
+
+    def opponent_name(self):
+        return "Robot" if self.robot_mode() else "Adversaire"
+
+    def display_turn(self, text):
+        return text if self.robot_mode() else text.replace("Robot", "Adversaire")
+
+    def mode_changed(self, *_):
+        if not hasattr(self, "analysis"):
+            return
+        name = self.opponent_name()
+        self.opponent_power_label.setText(f"Pouvoir {'du robot' if self.robot_mode() else 'de l’adversaire'}")
+        self.first.setItemText(1, name)
+        self.slot.setItemText(2, f"{name} 1")
+        self.slot.setItemText(3, f"{name} 2")
+        self.choose_for.setItemText(0, name)
+        if not self.robot_mode():
+            self.choose_for.setCurrentIndex(1)
+        self.choose_for.setEnabled(self.robot_mode())
+        self.analysis.tabs.setTabEnabled(2, self.robot_mode())
+        self.result_choice.setItemText(1, f"{name} gagnant")
+        self.placement_button.setVisible(self.robot_mode())
+        self.apply_placement_button.setVisible(self.robot_mode())
+        self.placement_status.setVisible(self.robot_mode())
+        self.placement_budget.setEnabled(self.robot_mode())
+        self.available_changed()
+
     def checked_powers(self):
         return [self.available.item(i).data(Qt.UserRole) for i in range(self.available.count())
                 if self.available.item(i).checkState() == Qt.Checked]
@@ -499,7 +550,7 @@ class MainWindow(QMainWindow):
             item.setToolTip(p.description)
             if p.supported:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(previous_checks.get(p.number, Qt.Checked))
+                item.setCheckState(previous_checks.get(p.number, Qt.Unchecked))
             else:
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             self.available.addItem(item)
@@ -512,7 +563,7 @@ class MainWindow(QMainWindow):
         for i, combo in enumerate((self.mine, self.robot)):
             combo.blockSignals(True)
             combo.clear()
-            if i == 1:
+            if i == 1 and self.robot_mode():
                 combo.addItem("À déterminer par le robot", -1)
             combo.addItem("Aucun pouvoir", 0)
             for p in candidates:
@@ -559,7 +610,7 @@ class MainWindow(QMainWindow):
     def render_placement(self, *_):
         if not hasattr(self, "placement"):
             return
-        self.placement_label.setText(" · ".join(f"{'M' if i < 2 else 'R'}{i % 2 + 1} : {coord(v) if v >= 0 else '…'}" for i, v in enumerate(self.positions)))
+        self.placement_label.setText(" · ".join(f"{'M' if i < 2 else 'R' if self.robot_mode() else 'A'}{i % 2 + 1} : {coord(v) if v >= 0 else '…'}" for i, v in enumerate(self.positions)))
         selected = self.slot.currentIndex()
         taken = {v for i, v in enumerate(self.positions) if i != selected and v >= 0}
         self.placement.set_allowed(set(range(25)) - taken)
@@ -567,12 +618,12 @@ class MainWindow(QMainWindow):
             powers = (self.mine.currentData(), self.robot.currentData())
             if None not in powers and powers[1] >= 0:
                 owner = placement_first(powers, self.first.currentIndex())
-                text = "Moi → Robot" if owner == 0 else "Robot → Moi"
+                text = f"Moi → {self.opponent_name()}" if owner == 0 else f"{self.opponent_name()} → Moi"
                 self.placement_order.setText(f"Ordre de placement : {text}" + (" (Bia)" if 13 in powers else ""))
                 self.placement_button.setEnabled(self.session is None and not self.loading and not self.load_failed
-                                                 and not self.placement_thinking)
+                                                 and not self.placement_thinking and self.robot_mode())
             else:
-                self.placement_order.setText("Ordre de placement : choisir d'abord le pouvoir du robot.")
+                self.placement_order.setText(f"Ordre de placement : choisir d’abord le pouvoir de {self.opponent_name().lower()}.")
                 self.placement_button.setEnabled(False)
 
     def place(self, cell):
@@ -619,6 +670,8 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.session = session
         if session:
+            self.robot_game.setChecked(session.settings.get("robot_mode", True))
+            self.mode_changed()
             self.game_budget.setValue(session.settings.get("move_seconds", 5))
             self.tabs.setCurrentIndex(1)
             self.footer.setText(f"Partie reprise : {self.store.current}")
@@ -643,7 +696,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("Choisissez le pouvoir du robot ou lancez sa comparaison.")
             pos = validate_setup((self.positions[:2], self.positions[2:]),
                                  (self.mine.currentData(), robot), self.first.currentIndex())
-            settings = {"move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
+            settings = {"robot_mode": self.robot_game.isChecked(), "move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
                         "placement_seconds": self.placement_budget.value(),
                         "available_powers": self.checked_powers(),
                         "families": {k: b.isChecked() for k, b in self.families.items()}}
@@ -657,22 +710,28 @@ class MainWindow(QMainWindow):
         self.cancel("power")
         self.invalidate_placement()
         self.session = session
+        self.mode_changed()
         self.game_budget.setValue(self.move_budget.value())
         self.tabs.setCurrentIndex(1)
         self.position_changed()
 
     def refresh(self):
         active = self.session is not None
-        playing = active and self.session.result is None
+        editing = self.correction_original is not None
+        playing = active and self.session.result is None and not self.correction_busy
+        self.cancel_correction_button.setVisible(editing)
+        self.commit_button.setText("Enregistrer le correctif" if editing else "Valider le tour / terminer")
+        self.update_correction_controls()
+        self.robot_game.setEnabled(not active)
         self.tabs.setTabEnabled(0, not active)
         self.start_button.setEnabled(not active and not self.loading and not self.load_failed)
-        self.undo_button.setEnabled(active and bool(self.session.history))
-        self.rethink.setEnabled(playing)
-        self.end_button.setEnabled(playing)
-        self.reset_button.setEnabled(active)
+        self.undo_button.setEnabled(active and bool(self.session.history) and not editing)
+        self.rethink.setEnabled(playing and not editing and (self.robot_mode() or self.session.position.player == 0))
+        self.end_button.setEnabled(playing and not editing)
+        self.reset_button.setEnabled(active and not editing)
         self.back.setEnabled(bool(self.draft) and playing)
         self.commit_button.setEnabled(self.complete is not None and playing)
-        self.analysis.apply.setEnabled(playing and self.advice is not None and self.advice.turn is not None and not self.thinking)
+        self.analysis.apply.setEnabled(playing and not editing and self.advice is not None and self.advice.turn is not None and not self.thinking)
         if not active:
             self.board.render_position(Position(workers=((-1, -1), (-1, -1))))
             self.turn_label.setText("Aucune partie en cours.")
@@ -684,23 +743,31 @@ class MainWindow(QMainWindow):
         for a in self.draft:
             preview = _apply(preview, a)
         shown = self.draft or (self.advice.turn.actions if self.advice and self.advice.turn else ())
+        self.board.table.opponent_tag = "R" if self.robot_mode() else "A"
         self.board.render_position(preview, {cell for a in shown for cell in (a.source, a.target) if cell >= 0})
-        powers = f"Moi : {POWERS[pos.powers[0]].name} · Robot : {POWERS[pos.powers[1]].name}"
+        powers = f"Moi : {POWERS[pos.powers[0]].name} · {self.opponent_name()} : {POWERS[pos.powers[1]].name}"
         if self.session.result:
             outcome = self.session.result
             winner = outcome.get("winner")
-            self.turn_label.setText(f"{'Partie interrompue' if winner is None else ('Moi' if winner == 0 else 'Robot') + ' gagne'} — {outcome['reason']}\n{powers}")
+            self.turn_label.setText(f"{'Partie interrompue' if winner is None else ('Moi' if winner == 0 else self.opponent_name()) + ' gagne'} — {outcome['reason']}\n{powers}")
         else:
-            self.turn_label.setText(f"Tour {len(self.session.history) + 1} — {'À moi' if pos.player == 0 else 'Au robot'}\n{powers}")
-        self.draft_text.setText("\n".join(a.label() for a in self.draft) or "Aucune action saisie.")
-        lines = []
-        for i, t in enumerate(self.session.history):
-            player = self.session.initial.player if i % 2 == 0 else 1 - self.session.initial.player
-            before = self.session.initial if i == 0 else self.session.history[i - 1].after
-            lines.append(f"{i + 1}. {'Moi' if player == 0 else 'Robot'}\n{t.description(before)}\n{t.power_summary(before)}\n")
-        if self.session.result:
-            lines.append(f"Résultat : {self.session.result}")
-        self.history.setPlainText("\n".join(lines))
+            self.turn_label.setText(f"Tour {len(self.session.history) + 1} — {'À moi' if pos.player == 0 else 'Au robot' if self.robot_mode() else 'À l’adversaire'}\n{powers}")
+        if editing:
+            self.turn_label.setText(f"Correction du tour {self.correction_index + 1} — "
+                                    f"{'Moi' if pos.player == 0 else self.opponent_name()}\n{powers}")
+        self.draft_text.setText("\n".join(self.display_turn(a.label()) for a in self.draft) or "Aucune action saisie.")
+        history_session = self.correction_original or self.session
+        selected = self.history.currentRow()
+        self.history.blockSignals(True)
+        self.history.clear()
+        for i, t in enumerate(history_session.history):
+            before = history_session.initial if i == 0 else history_session.history[i - 1].after
+            self.history.addItem(f"{i + 1}. {'Moi' if before.player == 0 else self.opponent_name()}\n{self.display_turn(t.description(before))}\n{self.display_turn(t.power_summary(before))}")
+        if history_session.result:
+            self.history.addItem(f"Résultat : {history_session.result}")
+        self.history.setCurrentRow(selected)
+        self.history.blockSignals(False)
+        self.update_correction_controls()
 
     def position_changed(self):
         self.generation += 1
@@ -715,11 +782,19 @@ class MainWindow(QMainWindow):
         self.analysis.explanation.clear()
         self.refresh()
         self.request_actions()
-        if self.session and self.session.result is None and self.session.position.player == 1:
+        if self.correction_original is not None:
+            self.analysis.status.setText("Correction en cours — calcul suspendu jusqu'à l'enregistrement.")
+            self.analysis.move_label.setText("Saisissez de nouveau le tour complet à corriger.")
+        elif (self.session and self.session.result is None
+              and self.session.position.player == (1 if self.robot_mode() else 0)):
             self.run_search()
         elif self.session and self.session.result is None:
-            self.analysis.move_label.setText("À vous de jouer. Recalculer permet de demander un conseil.")
-            self.analysis.status.setText("Le robot réfléchira après la validation de votre tour.")
+            if self.robot_mode():
+                self.analysis.move_label.setText("À vous de jouer. Recalculer permet de demander un conseil.")
+                self.analysis.status.setText("Le robot réfléchira après la validation de votre tour.")
+            else:
+                self.analysis.move_label.setText("À l’adversaire de jouer : saisissez son tour complet.")
+                self.analysis.status.setText("Aucun conseil adverse. Le moteur conseillera votre prochain tour.")
         else:
             self.analysis.status.setText("Partie terminée et sauvegardée.")
 
@@ -731,7 +806,7 @@ class MainWindow(QMainWindow):
         self.actor.clear()
         self.special.hide()
         self.refresh()
-        if not self.session or self.session.result:
+        if not self.session or self.session.result or self.correction_busy:
             return
         self.prompt.setText("Vérification des actions légales… La saisie reste indépendante de l'analyse.")
         self.launch("actions", (self.session.position, self.draft), self.input_generation,
@@ -747,7 +822,8 @@ class MainWindow(QMainWindow):
             return
         self.options, self.complete = payload
         if not self.draft and not self.options and self.complete is None and not self.session.result:
-            self.finish_loss()
+            if self.correction_original is None:
+                self.finish_loss()
             return
         kinds = sorted({a.kind for a in self.options if a.kind != "activate"})
         names = {"move": "Déplacement", "build": "Construction", "dome": "Dôme", "remove": "Retirer un bloc",
@@ -770,7 +846,7 @@ class MainWindow(QMainWindow):
         pairs = sorted({(a.player, a.worker) for a in self.options if a.kind == kind})
         for player, worker in pairs:
             source = next(a.source for a in self.options if a.kind == kind and (a.player, a.worker) == (player, worker))
-            text = "Cases adjacentes" if worker < 0 else f"{'Moi' if player == 0 else 'Robot'} {worker + 1}"
+            text = "Cases adjacentes" if worker < 0 else f"{'Moi' if player == 0 else self.opponent_name()} {worker + 1}"
             if source >= 0:
                 text += f" ({coord(source)})"
             self.actor.addItem(text, (player, worker))
@@ -800,9 +876,79 @@ class MainWindow(QMainWindow):
             self.draft = self.draft[:-1]
             self.request_actions()
 
+    def update_correction_controls(self):
+        if not hasattr(self, "correct_button"):
+            return
+        row = self.history.currentRow()
+        self.correct_button.setEnabled(self.session is not None and self.session.result is None
+                                       and self.correction_original is None
+                                       and 0 <= row < len(self.session.history))
+
+    def begin_correction(self):
+        row = self.history.currentRow()
+        if (not self.session or self.session.result or self.correction_original is not None
+                or not 0 <= row < len(self.session.history)):
+            return
+        self.correction_original = self.session
+        self.correction_index = row
+        self.session = replace(self.session, history=self.session.history[:row], result=None)
+        self.clear_error()
+        self.tabs.setCurrentIndex(1)
+        self.position_changed()
+
+    def cancel_correction(self):
+        if self.correction_original is None:
+            return
+        self.cancel("correction")
+        self.session = self.correction_original
+        self.correction_original = None
+        self.correction_index = None
+        self.correction_busy = False
+        self.clear_error()
+        self.position_changed()
+
+    def save_correction(self):
+        if self.correction_busy or self.complete is None:
+            return
+        self.correction_busy = True
+        self.input_generation += 1
+        self.cancel("actions")
+        self.coordinates.set_allowed(set())
+        self.special.hide()
+        self.prompt.setText("Reconstruction du plateau et vérification des tours suivants…")
+        self.refresh()
+        self.launch("correction", (self.correction_original, self.correction_index, self.complete.actions),
+                    self.generation, self.correction_ready, error=self.correction_error)
+
+    def correction_ready(self, corrected, token):
+        if token != self.generation or self.correction_original is None or self.closing:
+            return
+        try:
+            self.store.save(corrected)
+        except OSError as exc:
+            self.correction_error(f"Enregistrement impossible : {exc}", token)
+            return
+        self.session = corrected
+        self.correction_original = None
+        self.correction_index = None
+        self.correction_busy = False
+        self.clear_error()
+        self.footer.setText("Correctif sauvegardé ; plateau et positions reconstruits.")
+        self.position_changed()
+
+    def correction_error(self, message, token):
+        if token != self.generation or self.correction_original is None or self.closing:
+            return
+        self.correction_busy = False
+        self.fail(message)
+        self.request_actions()
+
     def commit_draft(self):
         if self.complete is not None:
-            self.commit(self.complete)
+            if self.correction_original is not None:
+                self.save_correction()
+            else:
+                self.commit(self.complete)
 
     def commit(self, turn):
         if not self.session or self.session.result:
@@ -820,7 +966,8 @@ class MainWindow(QMainWindow):
         self.position_changed()
 
     def run_search(self):
-        if not self.session or self.session.result:
+        if (not self.session or self.session.result or self.correction_original is not None
+                or (not self.robot_mode() and self.session.position.player != 0)):
             return
         self.generation += 1
         token = self.generation
@@ -847,7 +994,14 @@ class MainWindow(QMainWindow):
         if analysis.turn is None and analysis.complete_depth and analysis.score == -100_000:
             self.finish_loss()
             return
-        self.analysis.status.setText(f"Calcul terminé en {analysis.elapsed:.2f} s — {analysis.status}")
+        reasons = {"timeout": "Arrêt : temps imparti épuisé", "proof": "Arrêt anticipé : résultat démontré",
+                   "terminal": "Arrêt : partie terminée ou aucun tour légal", "cancelled": "Calcul annulé",
+                   "depth_limit": "Arrêt : profondeur maximale atteinte"}
+        reason = reasons.get(analysis.stop_reason, analysis.status)
+        total = time.monotonic() - self.thinking_started
+        attempt = (f" · profondeur {analysis.searching_depth} inachevée" if analysis.searching_depth else
+                   f" · profondeur {analysis.depth + 1} inachevée" if analysis.stop_reason == "timeout" and analysis.complete_depth else "")
+        self.analysis.status.setText(f"{reason} — {total:.2f} / {self.budget_used:g} s{attempt}")
         self.refresh()
 
     def search_error(self, message, token):
@@ -859,12 +1013,14 @@ class MainWindow(QMainWindow):
 
     def show_analysis(self, analysis: Analysis):
         self.advice = analysis
-        self.analysis.move_label.setText((analysis.turn.description(self.session.position) + "\n" + analysis.turn.power_summary(self.session.position))
+        self.analysis.move_label.setText((self.display_turn(analysis.turn.description(self.session.position)) + "\n" + analysis.turn.power_summary(self.session.position))
                                    if analysis.turn and self.session else analysis.status)
         proof = "Démontré" if analysis.proven else "Estimation" if analysis.score is not None else "Sans évaluation"
         score = "…" if analysis.score is None else str(analysis.score)
         self.analysis.metadata.setText(f"{proof} · score {score} pour le joueur au trait\nProfondeur {analysis.depth}"
-                                       f"{' complète' if analysis.complete_depth else ' partielle'} · {analysis.nodes:,} positions · {analysis.elapsed:.2f} s")
+                                       f"{' complète' if analysis.complete_depth else ' partielle'} · {analysis.nodes:,} positions · {analysis.elapsed:.2f} s\n"
+                                       f"Moteur {analysis.engine}" +
+                                       (f" · recherche à profondeur {analysis.searching_depth}" if analysis.searching_depth and self.thinking else ""))
         if analysis.proven:
             explanation = analysis.status
         elif analysis.turn:
@@ -878,7 +1034,7 @@ class MainWindow(QMainWindow):
         lines = []
         before = self.session.position if self.session else None
         for i, turn in enumerate(analysis.variation):
-            lines.append(f"{i + 1}. {turn.description(before) if before else turn.label()}")
+            lines.append(f"{i + 1}. {self.display_turn(turn.description(before) if before else turn.label())}")
             before = turn.after
         self.analysis.variation.setPlainText("\n\n".join(lines) or "Pas encore de variante calculée.")
         if self.session and not self.draft and analysis.turn:
@@ -932,6 +1088,8 @@ class MainWindow(QMainWindow):
             self.fail(f"Réinitialisation annulée : {exc}")
             return
         self.session = None
+        self.robot_game.setChecked(False)
+        self.mode_changed()
         self.generation += 1
         self.input_generation += 1
         self.power_generation += 1
@@ -1017,7 +1175,7 @@ class MainWindow(QMainWindow):
         self.render_placement()
 
     def recommend_placement(self):
-        if self.session is not None or self.loading or self.load_failed:
+        if self.session is not None or self.loading or self.load_failed or not self.robot_mode():
             return
         powers = (self.mine.currentData(), self.robot.currentData())
         if None in powers or powers[1] < 0:
@@ -1077,7 +1235,7 @@ class MainWindow(QMainWindow):
         self.render_placement()
 
     def apply_placement(self):
-        if self.session is not None or self.placement_thinking or self.placement_advice is None:
+        if self.session is not None or self.placement_thinking or self.placement_advice is None or not self.robot_mode():
             return
         # Only the robot's fields change. Human pieces remain theirs to place.
         self.positions[2:] = self.placement_advice.robot_cells
@@ -1093,7 +1251,9 @@ class MainWindow(QMainWindow):
     def tick(self):
         if self.thinking:
             elapsed = time.monotonic() - self.thinking_started
-            self.analysis.status.setText(f"Réflexion : {min(elapsed, self.budget_used):.1f} / {self.budget_used:g} s — saisie disponible")
+            depth = (f" — profondeur {self.advice.searching_depth} en cours ; dernière profondeur complète : "
+                     f"{self.advice.depth if self.advice.complete_depth else 0}" if self.advice and self.advice.searching_depth else "")
+            self.analysis.status.setText(f"Réflexion : {elapsed:.1f} / {self.budget_used:g} s{depth} — saisie disponible")
         if self.placement_thinking:
             elapsed = time.monotonic() - self.placement_started
             cells = (f" · proposition {coord(self.placement_advice.robot_cells[0])}, {coord(self.placement_advice.robot_cells[1])}"

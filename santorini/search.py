@@ -25,6 +25,9 @@ class Analysis:
     complete_depth: bool = False
     variation: tuple[Turn, ...] = ()
     status: str = ""
+    searching_depth: int = 0
+    stop_reason: str = ""
+    engine: str = "Python"
 
 
 def evaluate(s: Position, player: int) -> int:
@@ -85,13 +88,13 @@ def search(position: Position, seconds: float, cancelled=lambda: False,
                         complete, variation, status)
 
     if position.winner is not None:
-        return result(None, evaluate(position, root), 0, complete=True, status=position.reason)
+        return replace(result(None, evaluate(position, root), 0, complete=True, status=position.reason), stop_reason="terminal")
     try:
         fallback = next(legal_turns(position, check=check), None)
     except Interrupted:
-        return result(None, None, 0, status="Délai atteint avant de trouver un tour légal ; augmenter le budget.")
+        return replace(result(None, None, 0, status="Délai atteint avant de trouver un tour légal ; augmenter le budget."), stop_reason="cancelled" if cancelled() else "timeout")
     if fallback is None:
-        return result(None, -MATE, 0, complete=True, status="Aucun tour complet légal")
+        return replace(result(None, -MATE, 0, complete=True, status="Aucun tour complet légal"), stop_reason="terminal")
     best = result(fallback, None, 0, (fallback,), status="Tour légal de secours")
     publish(best)
 
@@ -162,7 +165,10 @@ def search(position: Position, seconds: float, cancelled=lambda: False,
             table[key] = (depth, value, flag, line)
         return value, line
 
+    attempted_depth = 0
     for depth in range(1, max_depth + 1):
+        attempted_depth = depth
+        publish(replace(best, searching_depth=depth, elapsed=time.monotonic() - started, nodes=nodes))
         candidate = None
         candidate_value = -MATE * 2
         alpha = -MATE * 2
@@ -175,6 +181,7 @@ def search(position: Position, seconds: float, cancelled=lambda: False,
                 alpha = max(alpha, v)
                 if v == MATE - 1:
                     best = result(turn, v, depth, (turn,) + tail, True, "Victoire immédiate démontrée")
+                    best.stop_reason = "proof"
                     publish(best)
                     return best
                 # During the first iteration, progressively improve the
@@ -192,8 +199,11 @@ def search(position: Position, seconds: float, cancelled=lambda: False,
         except Interrupted:
             break
     best.elapsed = time.monotonic() - started
-    if not best.proven:
-        best.status += " — budget atteint" if best.elapsed >= seconds else ""
+    best.searching_depth = attempted_depth if attempted_depth > best.depth else 0
+    best.stop_reason = ("proof" if best.proven else "cancelled" if cancelled() else
+                        "timeout" if time.monotonic() >= deadline else "depth_limit")
+    if best.stop_reason == "timeout":
+        best.status += " — temps imparti épuisé"
     return best
 
 

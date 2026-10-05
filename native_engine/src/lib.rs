@@ -70,7 +70,7 @@ pub struct CAnalysis {
     pub elapsed: f64,
     pub proven: u8,
     pub complete: u8,
-    pub status: u8, // 0 = budget, 1 = proof, 2 = no legal turn, 3 = no fallback
+    pub status: u8, // 0 budget, 1 proof, 2 terminal, 3 no fallback, 4 searching, 5 depth limit
 }
 
 fn adjacent(cell: i8) -> Vec<i8> {
@@ -645,6 +645,9 @@ pub unsafe extern "C" fn santoni_search(
         callback(&search.output(&best_line, best_score, 0, false, 0, &s));
     }
     'deepening: for depth in 1..=64 {
+        if let Some(callback) = publish {
+            callback(&search.output(&best_line, best_score, best_depth, complete, 4, &s));
+        }
         let moves = match search.moves(&s, best_line.first()) {
             Ok(m) => m,
             Err(_) => break,
@@ -698,7 +701,7 @@ pub unsafe extern "C" fn santoni_search(
         best_score,
         best_depth,
         complete,
-        u8::from(best_score.is_some_and(|v| v.abs() >= MATE - 1000)),
+        if best_score.is_some_and(|v| v.abs() >= MATE - 1000) { 1 } else if best_depth == 64 { 5 } else { 0 },
         &s,
     );
     0

@@ -115,7 +115,10 @@ def decode_analysis(value, position):
         f"Profondeur {value.depth} {'terminée' if value.complete else 'partielle'} — budget atteint")
     return Analysis(variation[0] if variation else None, value.score if value.has_score else None,
                     value.depth, value.nodes, value.elapsed, bool(value.proven), bool(value.complete),
-                    tuple(variation), status)
+                    tuple(variation), status,
+                    searching_depth=value.depth + 1 if value.status == 4 else 0,
+                    stop_reason={0: "timeout", 1: "proof", 2: "terminal", 3: "timeout", 4: "", 5: "depth_limit"}.get(value.status, ""),
+                    engine="Rust")
 
 
 def native_search(position, seconds, cancelled=lambda: False, publish=lambda result: None):

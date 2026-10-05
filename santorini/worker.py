@@ -22,6 +22,9 @@ def _compute(kind, args, cancelled, publish):
         if eligible(position) and library_path().exists() and budget >= 0.01:
             return native_search(position, budget, cancelled=cancelled, publish=publish)
         return search(position, budget, cancelled=cancelled, publish=publish)
+    if kind == "correction":
+        session, index, actions = args
+        return session.correct(index, actions)
     if kind == "power":
         return choose_power(*args, cancelled=cancelled, publish=publish)
     if kind == "placement":
@@ -46,12 +49,15 @@ def _process_main(kind, args, connection, cancelled):
         if hasattr(os, "nice"):
             os.nice(5)
         last = 0.0
+        last_depth = None
         def publish(value):
-            nonlocal last
+            nonlocal last, last_depth
             instant = time.monotonic()
-            if instant - last >= 0.1:
+            depth = getattr(value, "searching_depth", None)
+            if instant - last >= 0.1 or depth != last_depth:
                 connection.send(("progress", value))
                 last = instant
+                last_depth = depth
         result = _compute(kind, args, cancelled.is_set, publish)
         if not cancelled.is_set():
             connection.send(("result", result))

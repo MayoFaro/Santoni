@@ -20,6 +20,7 @@ def app():
 
 def window(app, tmp_path):
     w = MainWindow(Store(tmp_path), restore=False)
+    w.robot_game.setChecked(True)
     w.robot.setCurrentIndex(w.robot.findData(0))
     w.placement_budget.setValue(1)
     return w
@@ -88,6 +89,9 @@ def test_placement_cannot_modify_active_session(app, tmp_path):
 
 def test_power_change_cancels_pending_placement(app, tmp_path, monkeypatch):
     w = window(app, tmp_path)
+    from PySide6.QtCore import Qt
+    w.families["basic"].setChecked(True)
+    w.available.item(0).setCheckState(Qt.Checked)
     w.positions[:2] = [6, 8]
     w.recommend_placement()
     generation = w.placement_generation

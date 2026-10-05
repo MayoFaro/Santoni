@@ -73,3 +73,13 @@ def test_advanced_and_hero_positions_use_reference_engine():
     assert not eligible(Position(powers=(0, 46)))
     assert not eligible(Position(powers=(19, 0)))
     assert not eligible(Position(adonis=(0, 1, 1)))
+
+
+def test_search_reports_active_depth_and_deadline():
+    progress = []
+    result = native_search(Position(), .15, publish=progress.append)
+    assert result.stop_reason == "timeout"
+    assert result.engine == "Rust"
+    assert any(p.searching_depth > p.depth for p in progress)
+    assert any(p.searching_depth == result.depth + 1 for p in progress)
+    assert result.elapsed >= .14

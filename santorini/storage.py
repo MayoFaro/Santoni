@@ -42,6 +42,26 @@ class Session:
             outcome = {"winner": turn.after.winner, "reason": turn.after.reason, "recorded_at": now()}
         return replace(self, history=self.history + (turn,), result=outcome)
 
+    def correct(self, index, actions):
+        """Replace one full turn and recompute all later states atomically."""
+        if self.result is not None:
+            raise ValueError("La partie est terminée.")
+        if not 0 <= index < len(self.history):
+            raise ValueError("Tour à corriger introuvable.")
+        rebuilt = replace(self, history=self.history[:index], result=None)
+        replacement = validate_turn(rebuilt.position, tuple(actions))
+        rebuilt = rebuilt.append(replacement)
+        for number, old in enumerate(self.history[index + 1:], index + 2):
+            try:
+                if rebuilt.result is not None:
+                    raise ValueError("La partie est déjà terminée après le correctif.")
+                replayed = validate_turn(rebuilt.position, old.actions)
+            except ValueError as exc:
+                raise ValueError(f"Le tour {number} devient illégal après ce correctif. "
+                                 "Aucune modification enregistrée ; modifiez le correctif ou annulez la correction.") from exc
+            rebuilt = rebuilt.append(replayed)
+        return rebuilt
+
     def undo(self):
         if not self.history:
             return self

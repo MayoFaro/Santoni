@@ -153,3 +153,18 @@ Les étapes restantes sont décrites dans [docs/plan.md](docs/plan.md).
 
 Captures de l'application : [configuration](docs/configuration.png),
 [saisie](docs/saisie.png), [analyse](docs/analyse.png).
+
+Pendant une partie, l'onglet **Historique** permet de sélectionner un tour puis
+**Corriger le tour sélectionné**. Saisissez de nouveau le tour complet dans
+l'onglet Partie et cliquez sur **Enregistrer le correctif**. Le plateau est
+reconstruit et les tours suivants sont rejoués avec leurs actions enregistrées.
+Si un tour suivant devient illégal, son numéro est indiqué et la sauvegarde
+reste inchangée. **Annuler la correction** retrouve la partie d'origine.
+La réflexion reprend sur le plateau corrigé après son enregistrement.
+
+La case **Partie contre robot** est décochée par défaut. En mode adversaire
+humain, les conseils sont calculés automatiquement pour vos tours seulement ;
+les tours adverses sont saisis sans conseil. Ce mode est sauvegardé avec la
+partie. Les anciennes sauvegardes conservent le mode robot.
+Cocher une famille de pouvoirs affiche ses cartes sans les sélectionner :
+cochez individuellement les cartes disponibles pour constituer le choix.
