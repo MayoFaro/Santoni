@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sys
 import time
 from dataclasses import replace
@@ -10,13 +11,14 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QHeaderView, QPushButton, QTabWidget, QTableWidget,
+    QMainWindow, QHeaderView, QPushButton, QTabWidget, QTableWidget, QScrollArea,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
 from .engine import Action, Position, _apply, coord, validate_setup
 from .powers import POWERS, incompatible
 from .search import Analysis, PowerAdvice
+from .placement import PlacementAdvice, placement_first
 from .storage import Session, Store
 from .worker import Worker
 
@@ -131,7 +133,8 @@ class AnalysisWindow(QMainWindow):
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
-        self.setWindowTitle("Santoni — Analyse")
+        preview = os.environ.get("SANTONI_PREVIEW_LABEL")
+        self.setWindowTitle("Santoni — Analyse" + (f" [{preview}]" if preview else ""))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.resize(520, 670)
         container = QWidget()
@@ -172,6 +175,22 @@ class AnalysisWindow(QMainWindow):
         self.use_power.setEnabled(False)
         pl.addWidget(self.use_power)
         self.tabs.addTab(power, "Choix du pouvoir")
+        placement = QWidget()
+        sl = QVBoxLayout(placement)
+        self.placement_text = QLabel("Choisissez les deux pouvoirs et l'ordre de placement dans Configuration.")
+        self.placement_text.setWordWrap(True)
+        sl.addWidget(self.placement_text)
+        self.placement_board = Board()
+        sl.addWidget(self.placement_board)
+        self.placement_board.render_position(Position(workers=((-1, -1), (-1, -1))))
+        self.use_placement = button("Appliquer le placement conseillé", owner.apply_placement, True)
+        self.use_placement.setEnabled(False)
+        sl.addWidget(self.use_placement)
+        note = QLabel("Robot en premier : les pions adverses montrés sont une réponse hypothétique, pas un placement imposé.")
+        note.setWordWrap(True)
+        sl.addWidget(note)
+        sl.addStretch()
+        self.tabs.addTab(placement, "Placement")
 
     def closeEvent(self, event):
         if not self.owner.closing:
@@ -190,6 +209,7 @@ class MainWindow(QMainWindow):
         self.generation = 0
         self.input_generation = 0
         self.power_generation = 0
+        self.placement_generation = 0
         self.workers = {}
         self.retired = set()
         self.draft = ()
@@ -197,12 +217,16 @@ class MainWindow(QMainWindow):
         self.complete = None
         self.advice = None
         self.power_advice = None
+        self.placement_advice = None
+        self.placement_thinking = False
+        self.placement_started = 0
         self.power_target = 1
         self.thinking = False
         self.thinking_started = 0
         self.budget_used = 0
         self.positions = [-1] * 4
-        self.setWindowTitle("Santoni — Saisie")
+        preview = os.environ.get("SANTONI_PREVIEW_LABEL")
+        self.setWindowTitle("Santoni — Saisie" + (f" [{preview}]" if preview else ""))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setMinimumWidth(420)
         self.resize(450, 850)
@@ -300,11 +324,34 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.placement_label)
         self.placement = Coordinates(self.place)
         gl.addWidget(self.placement)
+        self.placement_order = QLabel()
+        self.placement_order.setWordWrap(True)
+        gl.addWidget(self.placement_order)
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Réflexion sur le placement"))
+        self.placement_budget = QDoubleSpinBox()
+        self.placement_budget.setRange(1, 600)
+        self.placement_budget.setValue(10)
+        self.placement_budget.setSuffix(" s")
+        self.placement_budget.valueChanged.connect(self.invalidate_placement)
+        budget_row.addWidget(self.placement_budget)
+        gl.addLayout(budget_row)
+        self.placement_button = button("Suggérer le placement du robot", self.recommend_placement)
+        gl.addWidget(self.placement_button)
+        self.placement_status = QLabel("Choisissez les deux pouvoirs avant de demander un placement.")
+        self.placement_status.setWordWrap(True)
+        gl.addWidget(self.placement_status)
+        self.apply_placement_button = button("Appliquer ces positions au robot", self.apply_placement, True)
+        self.apply_placement_button.setEnabled(False)
+        gl.addWidget(self.apply_placement_button)
         layout.addWidget(group)
         self.start_button = button("Démarrer la partie", self.start_game, True)
         layout.addWidget(self.start_button)
         layout.addStretch()
-        self.tabs.addTab(page, "Configuration")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        self.tabs.addTab(scroll, "Configuration")
 
     def _game(self):
         page = QWidget()
@@ -437,6 +484,7 @@ class MainWindow(QMainWindow):
     def configuration_changed(self, *_):
         if not hasattr(self, "analysis"):
             return
+        self.invalidate_placement()
         self.power_generation += 1
         self.cancel("power")
         self.power_advice = None
@@ -470,8 +518,20 @@ class MainWindow(QMainWindow):
         selected = self.slot.currentIndex()
         taken = {v for i, v in enumerate(self.positions) if i != selected and v >= 0}
         self.placement.set_allowed(set(range(25)) - taken)
+        if hasattr(self, "placement_order"):
+            powers = (self.mine.currentData(), self.robot.currentData())
+            if None not in powers and powers[1] >= 0:
+                owner = placement_first(powers, self.first.currentIndex())
+                text = "Moi → Robot" if owner == 0 else "Robot → Moi"
+                self.placement_order.setText(f"Ordre de placement : {text}" + (" (Bia)" if 13 in powers else ""))
+                self.placement_button.setEnabled(self.session is None and not self.loading and not self.load_failed
+                                                 and not self.placement_thinking)
+            else:
+                self.placement_order.setText("Ordre de placement : choisir d'abord le pouvoir du robot.")
+                self.placement_button.setEnabled(False)
 
     def place(self, cell):
+        self.invalidate_placement()
         index = self.slot.currentIndex()
         self.positions[index] = cell
         mine, robot = self.mine.currentData(), self.robot.currentData()
@@ -539,6 +599,7 @@ class MainWindow(QMainWindow):
             pos = validate_setup((self.positions[:2], self.positions[2:]),
                                  (self.mine.currentData(), robot), self.first.currentIndex())
             settings = {"move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
+                        "placement_seconds": self.placement_budget.value(),
                         "available_powers": self.checked_powers(),
                         "families": {k: b.isChecked() for k, b in self.families.items()}}
             session = Session(pos, settings=settings)
@@ -549,6 +610,7 @@ class MainWindow(QMainWindow):
         self.clear_error()
         self.power_generation += 1
         self.cancel("power")
+        self.invalidate_placement()
         self.session = session
         self.game_budget.setValue(self.move_budget.value())
         self.tabs.setCurrentIndex(1)
@@ -895,10 +957,104 @@ class MainWindow(QMainWindow):
             combo = self.robot if self.power_target == 1 else self.mine
             combo.setCurrentIndex(combo.findData(self.power_advice.power))
 
+    def invalidate_placement(self, *_):
+        if not hasattr(self, "analysis"):
+            return
+        self.placement_generation += 1
+        self.cancel("placement")
+        self.placement_thinking = False
+        self.placement_advice = None
+        self.analysis.use_placement.setEnabled(False)
+        self.apply_placement_button.setEnabled(False)
+        self.placement_status.setText("Placement modifié : demander une nouvelle suggestion.")
+        self.analysis.placement_text.setText("Demandez une suggestion après avoir choisi les pouvoirs et le premier joueur.")
+        self.analysis.placement_board.render_position(Position(workers=((-1, -1), (-1, -1))))
+        self.render_placement()
+
+    def recommend_placement(self):
+        if self.session is not None or self.loading or self.load_failed:
+            return
+        powers = (self.mine.currentData(), self.robot.currentData())
+        if None in powers or powers[1] < 0:
+            self.fail("Choisissez d'abord les deux pouvoirs, y compris celui du robot.")
+            return
+        first = placement_first(powers, self.first.currentIndex())
+        opponent = tuple(self.positions[:2]) if first == 0 else None
+        if opponent and (any(c < 0 for c in opponent) or len(set(opponent)) != 2):
+            self.fail("Vous vous placez en premier : saisissez vos deux bâtisseurs avant de demander le placement du robot.")
+            return
+        self.invalidate_placement()
+        self.clear_error()
+        self.placement_thinking = True
+        self.placement_started = time.monotonic()
+        budget = self.placement_budget.value()
+        self.placement_status.setText("Recherche du placement du robot…")
+        self.placement_button.setEnabled(False)
+        self.analysis.placement_text.setText("Recherche en cours ; les coordonnées restent saisissables.")
+        self.analysis.tabs.setCurrentIndex(2)
+        self.launch("placement", (powers, self.first.currentIndex(), budget, opponent,
+                                  self.placement_started + budget), self.placement_generation,
+                    self.placement_ready, self.placement_progress, self.placement_error)
+
+    def placement_progress(self, advice: PlacementAdvice, token):
+        if token != self.placement_generation or self.session is not None or self.closing:
+            return
+        self.placement_advice = advice
+        cells = advice.robot_cells
+        pair = f"Robot 1 : {coord(cells[0])} · Robot 2 : {coord(cells[1])}"
+        order = "Le robot répond à votre placement." if advice.first_to_place == 0 else (
+            "Le robot se place en premier ; votre placement futur n'est pas utilisé.")
+        score = "…" if advice.score is None else f"{advice.score:+.1f}"
+        self.placement_status.setText(f"{pair}\n{'Recherche en cours' if self.placement_thinking else 'Suggestion prête'}")
+        self.analysis.placement_text.setText(f"{pair}\n{order}\n{advice.status}\n"
+                                             f"Estimation {score} · {advice.elapsed:.2f} s")
+        opponent = advice.opponent_cells or (-1, -1)
+        preview = Position(workers=(opponent, cells), powers=(self.mine.currentData(), self.robot.currentData()),
+                           player=self.first.currentIndex())
+        self.analysis.placement_board.render_position(preview, cells)
+
+    def placement_ready(self, advice, token):
+        if token != self.placement_generation or self.session is not None or self.closing:
+            return
+        self.placement_thinking = False
+        self.placement_progress(advice, token)
+        self.analysis.use_placement.setEnabled(True)
+        self.apply_placement_button.setEnabled(True)
+        self.render_placement()
+
+    def placement_error(self, message, token):
+        if token != self.placement_generation or self.closing:
+            return
+        self.placement_thinking = False
+        self.placement_advice = None
+        self.placement_status.setText("Placement non calculé : " + message)
+        self.fail(message)
+        self.render_placement()
+
+    def apply_placement(self):
+        if self.session is not None or self.placement_thinking or self.placement_advice is None:
+            return
+        # Only the robot's fields change. Human pieces remain theirs to place.
+        self.positions[2:] = self.placement_advice.robot_cells
+        self.clear_error()
+        conflicts = [i for i in (0, 1) if self.positions[i] in self.positions[2:]]
+        if conflicts:
+            self.fail("Le robot se place en premier : modifiez vos pions qui occupent une case maintenant choisie par le robot.")
+            self.slot.setCurrentIndex(conflicts[0])
+        elif self.placement_advice.first_to_place == 1:
+            self.slot.setCurrentIndex(0)
+        self.render_placement()
+
     def tick(self):
         if self.thinking:
             elapsed = time.monotonic() - self.thinking_started
             self.analysis.status.setText(f"Réflexion : {min(elapsed, self.budget_used):.1f} / {self.budget_used:g} s — saisie disponible")
+        if self.placement_thinking:
+            elapsed = time.monotonic() - self.placement_started
+            cells = (f" · proposition {coord(self.placement_advice.robot_cells[0])}, {coord(self.placement_advice.robot_cells[1])}"
+                     if self.placement_advice else "")
+            self.placement_status.setText(f"Placement : {min(elapsed, self.placement_budget.value()):.1f} / "
+                                          f"{self.placement_budget.value():g} s{cells}")
 
     def closeEvent(self, event):
         if not self.closing:

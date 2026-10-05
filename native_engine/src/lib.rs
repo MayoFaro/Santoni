@@ -597,7 +597,7 @@ pub unsafe extern "C" fn santoni_search(
     if state.is_null()
         || output.is_null()
         || !seconds.is_finite()
-        || !(0.01..=3600.0).contains(&seconds)
+        || !(0.001..=3600.0).contains(&seconds)
     {
         return -1;
     }

@@ -24,6 +24,13 @@ def _compute(kind, args, cancelled, publish):
         return search(position, budget, cancelled=cancelled, publish=publish)
     if kind == "power":
         return choose_power(*args, cancelled=cancelled, publish=publish)
+    if kind == "placement":
+        from .placement import choose_placement
+        powers, first, budget, opponent, *end = args
+        if end:
+            budget = max(.1, min(budget, end[0] - time.monotonic()))
+        return choose_placement(powers, first, budget, opponent,
+                                cancelled=cancelled, publish=publish)
     if kind == "actions":
         def check():
             if cancelled():

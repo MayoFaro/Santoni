@@ -11,6 +11,9 @@
 - Moteur Python de référence : dix héros et dix-huit dieux avancés publics.
 - Vérification indépendante des tours proposés par Rust.
 - Sauvegarde après chaque modification validée, reprise, archive avec résultat.
+- Conseil de placement sur la branche `feature/placement-advice` : réponse au
+  placement connu ou anticipation des réponses adverses, budget distinct, Bia,
+  Eros et identité des pièces de Selene. Voir [placement.md](placement.md).
 
 ## Extension du moteur
 

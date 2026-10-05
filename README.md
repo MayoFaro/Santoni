@@ -1,5 +1,22 @@
 # Santoni
 
+## Tester la branche de conseil de placement
+
+Cette version est isolée sur `feature/placement-advice`, dans
+`.worktrees/placement-advice/`. Le raccourci de bureau reste associé à la version
+principale ; aucune bascule de l'application en cours n'est effectuée.
+
+Depuis le dossier de cette branche, lancez :
+
+```bash
+./preview_placement.sh
+```
+
+Les fenêtres portent la mention **Test placement**. Ce lanceur utilise ses propres
+sauvegardes dans `.preview-data/` : il ne reprend ni ne modifie la partie de la
+version principale. Les détails de cette fonctionnalité figurent dans
+[docs/placement.md](docs/placement.md).
+
 Application native Linux pour jouer à Santorini contre un moteur de recherche.
 Deux fenêtres PySide6, **Saisie** et **Analyse**, restent au-dessus des autres
 applications, comme dans Digitcode. Ctrl + molette règle leur opacité séparément.
@@ -30,6 +47,10 @@ Le moteur Rust n'a aucune dépendance externe à télécharger.
    lettre A–E et un nombre 1–5. La pièce suivante est sélectionnée automatiquement.
    Eros impose les bords opposés ; Bia place ses pièces en premier. Pour Selene,
    la pièce numéro 2 représente la bâtisseuse.
+   Vous pouvez également utiliser **Suggérer le placement du robot**, puis
+   **Appliquer ces positions au robot**. Si vous vous placez en premier, saisissez
+   d'abord vos deux pions. Si le robot se place en premier, demandez son placement
+   avant de choisir le vôtre. Bia détermine l'ordre du placement lorsqu'il est présent.
 5. Démarrez. À votre tour, choisissez le bâtisseur puis saisissez la destination
    et la construction, toujours lettre puis nombre. Seules les actions qui
    peuvent appartenir à un tour complet légal sont proposées.
