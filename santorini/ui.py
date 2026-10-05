@@ -93,11 +93,12 @@ class Coordinates(QWidget):
                 self.callback(cell)
 
 
-class Board(QTableWidget):
+class BoardGrid(QTableWidget):
     def __init__(self):
         super().__init__(5, 5)
         self.setHorizontalHeaderLabels(list("ABCDE"))
-        self.setVerticalHeaderLabels(list("12345"))
+        self.setVerticalHeaderLabels(list("54321"))
+        self.horizontalHeader().hide()
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.NoSelection)
         self.setFocusPolicy(Qt.NoFocus)
@@ -126,7 +127,41 @@ class Board(QTableWidget):
                 color = "#fff2ac"
             item.setBackground(QColor(color))
             item.setForeground(QColor("#263443"))
-            self.setItem(cell // 5, cell % 5, item)
+            self.setItem(4 - cell // 5, cell % 5, item)
+
+
+class Board(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.table = BoardGrid()
+        layout.addWidget(self.table)
+        self.labels = QWidget()
+        footer = QHBoxLayout(self.labels)
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(0)
+        self.corner = QWidget()
+        footer.addWidget(self.corner)
+        for letter in "ABCDE":
+            label = QLabel(letter)
+            label.setAlignment(Qt.AlignCenter)
+            footer.addWidget(label, 1)
+        layout.addWidget(self.labels)
+        self.table.verticalHeader().sectionResized.connect(self.align_labels)
+
+    def align_labels(self, *_):
+        self.corner.setFixedWidth(self.table.verticalHeader().width() + self.table.frameWidth())
+        self.labels.layout().setContentsMargins(0, 0, self.table.frameWidth(), 0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.align_labels()
+
+    def render_position(self, position, highlights=()):
+        self.table.render_position(position, highlights)
+        self.align_labels()
 
 
 class AnalysisWindow(QMainWindow):
@@ -228,8 +263,14 @@ class MainWindow(QMainWindow):
         preview = os.environ.get("SANTONI_PREVIEW_LABEL")
         self.setWindowTitle("Santoni — Saisie" + (f" [{preview}]" if preview else ""))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setMinimumWidth(420)
-        self.resize(450, 850)
+        self.setMinimumWidth(350)
+        self.resize(390, 700)
+        self.setStyleSheet("""
+            QWidget { font-size: 11px; }
+            QPushButton { padding: 3px 6px; }
+            QPushButton[chip="true"] { border-radius: 10px; min-width: 22px; min-height: 18px; }
+            QGroupBox { margin-top: 7px; padding-top: 6px; }
+        """)
         container = QWidget()
         self.setCentralWidget(container)
         layout = QVBoxLayout(container)
@@ -267,7 +308,7 @@ class MainWindow(QMainWindow):
         self.families = {}
         for key, text in [("basic", "Dieux de base"), ("hero", "Pouvoirs de héros"), ("advanced", "Dieux avancés")]:
             box = QCheckBox(text)
-            box.setChecked(key == "basic")
+            box.setChecked(False)
             box.toggled.connect(self.refresh_configuration)
             self.families[key] = box
             row.addWidget(box)
@@ -360,6 +401,10 @@ class MainWindow(QMainWindow):
         self.turn_label.setWordWrap(True)
         layout.addWidget(self.turn_label)
         self.board = Board()
+        self.board.table.setMinimumHeight(185)
+        self.board.table.setMaximumHeight(225)
+        for row_index in range(5):
+            self.board.table.setRowHeight(row_index, 32)
         layout.addWidget(self.board)
         self.prompt = QLabel("Choisissez une configuration.")
         self.prompt.setWordWrap(True)
