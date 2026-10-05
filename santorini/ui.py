@@ -6,10 +6,10 @@ import sys
 import time
 from dataclasses import replace
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QHeaderView, QPushButton, QTabWidget, QTableWidget, QScrollArea,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
@@ -30,6 +30,7 @@ QPushButton:hover { background: #dfeafa; }
 QPushButton:disabled { color: #8a919a; }
 QPushButton[chip="true"] { border-radius: 13px; min-width: 32px; min-height: 25px; background: #fff; color: #263443; }
 QPushButton[chip="true"]:checked { background: #263443; color: white; }
+QPushButton[chip="true"]:disabled { color: #939ba5; background: #f0f2f4; border-color: #d5d9df; }
 QPushButton[primary="true"] { background: #245f9b; color: white; font-weight: bold; }
 QPushButton[primary="true"]:disabled { background: #e4e7eb; color: #8a919a; border-color: #ccd0d5; }
 QGroupBox { font-weight: bold; margin-top: 9px; padding-top: 8px; }
@@ -42,6 +43,56 @@ def button(text, callback, primary=False):
     b.setProperty("primary", primary)
     b.clicked.connect(callback)
     return b
+
+
+class ButtonChoices(QWidget):
+    """Exclusive, keyboard-accessible choices with explicit legal availability."""
+    currentIndexChanged = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons, self.values = [], []
+        self.index = -1
+        self.group.idClicked.connect(self.setCurrentIndex)
+
+    def clear(self):
+        for chip in self.buttons:
+            self.group.removeButton(chip)
+            self.row.removeWidget(chip)
+            chip.hide()
+            chip.deleteLater()
+        self.buttons, self.values, self.index = [], [], -1
+
+    def addItem(self, text, value, enabled=True, description=None):
+        chip = QPushButton(text)
+        chip.setCheckable(True)
+        chip.setProperty("chip", True)
+        chip.setEnabled(enabled)
+        chip.setAccessibleName(description or text)
+        chip.setToolTip(description or text)
+        index = len(self.buttons)
+        self.group.addButton(chip, index)
+        self.row.addWidget(chip)
+        self.buttons.append(chip)
+        self.values.append(value)
+        if self.index < 0 and enabled:
+            self.setCurrentIndex(index)
+
+    def setCurrentIndex(self, index):
+        if not 0 <= index < len(self.buttons) or not self.buttons[index].isEnabled():
+            return
+        changed = self.index != index
+        self.index = index
+        self.buttons[index].setChecked(True)
+        if changed:
+            self.currentIndexChanged.emit(index)
+
+    def currentData(self):
+        return self.values[self.index] if self.index >= 0 else None
 
 
 class Coordinates(QWidget):
@@ -320,6 +371,11 @@ class MainWindow(QMainWindow):
         self.robot_game.setChecked(False)
         self.robot_game.toggled.connect(self.mode_changed)
         layout.addWidget(self.robot_game)
+        self.arena_mode = QCheckBox("Mode Arena — dieux de base, avancés et héros")
+        self.arena_mode.setToolTip("Sans Toison d’or. Choisissez les cartes disponibles, puis le pouvoir de chaque joueur.")
+        self.arena_mode.toggled.connect(self.arena_changed)
+        self.pre_arena_families = None
+        layout.addWidget(self.arena_mode)
         row = QHBoxLayout()
         self.families = {}
         for key, text in [("basic", "Dieux de base"), ("hero", "Pouvoirs de héros"), ("advanced", "Dieux avancés")]:
@@ -427,8 +483,8 @@ class MainWindow(QMainWindow):
         self.prompt.setWordWrap(True)
         layout.addWidget(self.prompt)
         row = QHBoxLayout()
-        self.action_kind = QComboBox()
-        self.actor = QComboBox()
+        self.action_kind = ButtonChoices()
+        self.actor = ButtonChoices()
         self.action_kind.currentIndexChanged.connect(self.update_actors)
         self.actor.currentIndexChanged.connect(self.update_coordinates)
         row.addWidget(self.action_kind)
@@ -530,6 +586,16 @@ class MainWindow(QMainWindow):
         self.placement_status.setVisible(self.robot_mode())
         self.placement_budget.setEnabled(self.robot_mode())
         self.available_changed()
+
+    def arena_changed(self, checked):
+        if checked:
+            self.pre_arena_families = {key: box.isChecked() for key, box in self.families.items()}
+        for key, box in self.families.items():
+            box.blockSignals(True)
+            box.setChecked(True if checked else (self.pre_arena_families or {}).get(key, False))
+            box.setEnabled(not checked)
+            box.blockSignals(False)
+        self.refresh_configuration()
 
     def checked_powers(self):
         return [self.available.item(i).data(Qt.UserRole) for i in range(self.available.count())
@@ -670,6 +736,7 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.session = session
         if session:
+            self.arena_mode.setChecked(session.settings.get("rules_mode", "custom") == "arena")
             self.robot_game.setChecked(session.settings.get("robot_mode", True))
             self.mode_changed()
             self.game_budget.setValue(session.settings.get("move_seconds", 5))
@@ -694,9 +761,12 @@ class MainWindow(QMainWindow):
             robot = self.robot.currentData()
             if robot < 0:
                 raise ValueError("Choisissez le pouvoir du robot ou lancez sa comparaison.")
+            if self.arena_mode.isChecked() and (self.mine.currentData() == 0 or robot == 0):
+                raise ValueError("En mode Arena, choisissez un pouvoir pour chaque joueur.")
             pos = validate_setup((self.positions[:2], self.positions[2:]),
                                  (self.mine.currentData(), robot), self.first.currentIndex())
-            settings = {"robot_mode": self.robot_game.isChecked(), "move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
+            settings = {"rules_mode": "arena" if self.arena_mode.isChecked() else "custom",
+                        "robot_mode": self.robot_game.isChecked(), "move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
                         "placement_seconds": self.placement_budget.value(),
                         "available_powers": self.checked_powers(),
                         "families": {k: b.isChecked() for k, b in self.families.items()}}
@@ -723,6 +793,7 @@ class MainWindow(QMainWindow):
         self.commit_button.setText("Enregistrer le correctif" if editing else "Valider le tour / terminer")
         self.update_correction_controls()
         self.robot_game.setEnabled(not active)
+        self.arena_mode.setEnabled(not active)
         self.tabs.setTabEnabled(0, not active)
         self.start_button.setEnabled(not active and not self.loading and not self.load_failed)
         self.undo_button.setEnabled(active and bool(self.session.history) and not editing)
@@ -746,6 +817,8 @@ class MainWindow(QMainWindow):
         self.board.table.opponent_tag = "R" if self.robot_mode() else "A"
         self.board.render_position(preview, {cell for a in shown for cell in (a.source, a.target) if cell >= 0})
         powers = f"Moi : {POWERS[pos.powers[0]].name} · {self.opponent_name()} : {POWERS[pos.powers[1]].name}"
+        if self.session.settings.get("rules_mode") == "arena":
+            powers = "Arena · " + powers
         if self.session.result:
             outcome = self.session.result
             winner = outcome.get("winner")
@@ -830,8 +903,11 @@ class MainWindow(QMainWindow):
                  "kill": "Éliminer", "force": "Déplacement forcé", "place": "Nouveau bâtisseur", "adonis": "Cible d'Adonis"}
         self.action_kind.blockSignals(True)
         self.action_kind.clear()
-        for kind in kinds:
-            self.action_kind.addItem(names.get(kind, kind), kind)
+        symbols = {"move": "↗", "build": "▦", "dome": "◉", "remove": "−",
+                   "kill": "×", "force": "⇢", "place": "+", "adonis": "◎"}
+        for kind in ["move", "build"] + [k for k in kinds if k not in ("move", "build")]:
+            self.action_kind.addItem(symbols.get(kind, kind), kind, enabled=kind in kinds,
+                                     description=names.get(kind, kind))
         self.action_kind.blockSignals(False)
         self.special.setVisible(any(a.kind == "activate" for a in self.options))
         self.prompt.setText("Tour complet : validez, ou poursuivez avec une action facultative." if self.complete else
@@ -840,16 +916,29 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def update_actors(self, *_):
+        previous = self.actor.currentData()
         self.actor.blockSignals(True)
         self.actor.clear()
         kind = self.action_kind.currentData()
-        pairs = sorted({(a.player, a.worker) for a in self.options if a.kind == kind})
-        for player, worker in pairs:
-            source = next(a.source for a in self.options if a.kind == kind and (a.player, a.worker) == (player, worker))
+        available = {(a.player, a.worker) for a in self.options if a.kind == kind}
+        preview = self.session.position if self.session else None
+        if preview:
+            for action in self.draft:
+                preview = _apply(preview, action)
+        players = ({p for p, w in available} or {preview.player}) if preview else set()
+        pairs = {(p, w) for p in players for w in range(len(preview.workers[p]))
+                 if preview and preview.workers[p][w] >= 0} | available
+        for player, worker in sorted(pairs):
+            source = next((a.source for a in self.options
+                           if a.kind == kind and (a.player, a.worker) == (player, worker)),
+                          preview.workers[player][worker]
+                          if preview and 0 <= worker < len(preview.workers[player]) else -1)
             text = "Cases adjacentes" if worker < 0 else f"{'Moi' if player == 0 else self.opponent_name()} {worker + 1}"
             if source >= 0:
-                text += f" ({coord(source)})"
-            self.actor.addItem(text, (player, worker))
+                text += f" · {coord(source)}"
+            self.actor.addItem(text, (player, worker), enabled=(player, worker) in available)
+        if previous in self.actor.values:
+            self.actor.setCurrentIndex(self.actor.values.index(previous))
         self.actor.blockSignals(False)
         self.update_coordinates()
 
