@@ -64,3 +64,13 @@ première application d'entraînement à deux joueurs.
 Une recherche limitée dans le temps ne permet pas de promettre un coup optimal
 pour toute position. La priorité reste un tour complet légal à l'échéance,
 puis une force mesurée et une explication honnête du niveau de certitude.
+
+## Résultat de la comparaison des budgets
+
+La deuxième campagne oppose le moteur initial à 35 s au même moteur à 5 s :
+144 victoires sur 200 pour le budget long, avec budgets inversés sur chaque
+configuration. Le [bilan détaillé](bilan-moteur-35s-vs-5s-20261005.md) confirme
+l'intérêt d'améliorer l'efficacité de la recherche à 5 s et conserve les
+priorités d'évaluation des constructions et de tri tactique.
+Chaque amélioration sera développée sur une branche distincte, comparée à la
+référence initiale figée et au `main` courant, puis fusionnée après validation.

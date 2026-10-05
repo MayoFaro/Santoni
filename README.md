@@ -220,3 +220,13 @@ python tools/recheck_selfplay.py experiments/selfplay-100-5s-20261005 --cases 16
 `tools/report_selfplay.py` met en forme le rapport de la **première campagne** ;
 ses commentaires sur les parties 16 et 18 sont spécifiques à ces données.
 Utiliser `tools/analyse_selfplay.py` pour les mesures d’une nouvelle campagne.
+
+### Deuxième campagne : 35 secondes contre 5 secondes
+
+Le moteur initial à 35 s gagne **144 des 200 parties (72 %)** contre le même
+moteur à 5 s, avec inversion des budgets pour chaque configuration initiale.
+Voir le [bilan et les conclusions](docs/bilan-moteur-35s-vs-5s-20261005.md),
+le [protocole](docs/campagne-35s-vs-5s.md) et les
+[résultats détaillés](experiments/baseline-35s-vs-5s-20261005/rapport.md).
+La [référence figée](experiments/references/initial-cb732bb/README.md) conserve
+les sources et le binaire recompilé pour les futures comparaisons.
