@@ -1,0 +1,200 @@
+[
+  {
+    "id": "hephaestus-ramp-game16-ply26",
+    "position": {
+      "heights": [
+        3,
+        1,
+        3,
+        0,
+        0,
+        1,
+        0,
+        3,
+        0,
+        0,
+        0,
+        3,
+        3,
+        3,
+        0,
+        3,
+        1,
+        0,
+        0,
+        0,
+        0,
+        3,
+        3,
+        0,
+        0
+      ],
+      "domes": 1,
+      "workers": [
+        [
+          1,
+          16
+        ],
+        [
+          10,
+          6
+        ]
+      ],
+      "powers": [
+        6,
+        7
+      ],
+      "player": 0,
+      "hero_used": [
+        false,
+        false
+      ],
+      "athena_lock": false,
+      "adonis": null,
+      "winner": null,
+      "reason": ""
+    },
+    "seconds": 5,
+    "original_actions": [
+      {
+        "kind": "move",
+        "player": 0,
+        "worker": 1,
+        "source": 16,
+        "target": 17
+      },
+      {
+        "kind": "build",
+        "player": 0,
+        "worker": 1,
+        "source": 17,
+        "target": 16
+      },
+      {
+        "kind": "build",
+        "player": 0,
+        "worker": 1,
+        "source": 17,
+        "target": 16
+      }
+    ],
+    "improved_actions": [
+      {
+        "kind": "move",
+        "player": 0,
+        "worker": 1,
+        "source": 16,
+        "target": 17
+      },
+      {
+        "kind": "build",
+        "player": 0,
+        "worker": 1,
+        "source": 17,
+        "target": 18
+      }
+    ],
+    "evidence": {
+      "old_winner": 1,
+      "new_winner": 0,
+      "opponent_proven_loss": true,
+      "opponent_score": -99992
+    },
+    "note": "Confirmed winning alternative to the 5-second move; do not assert deterministic timing."
+  },
+  {
+    "id": "hermes-horizon-game18-ply28",
+    "position": {
+      "heights": [
+        3,
+        3,
+        3,
+        3,
+        3,
+        3,
+        0,
+        3,
+        1,
+        0,
+        1,
+        3,
+        3,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        0,
+        0
+      ],
+      "domes": 0,
+      "workers": [
+        [
+          6,
+          17
+        ],
+        [
+          13,
+          15
+        ]
+      ],
+      "powers": [
+        7,
+        6
+      ],
+      "player": 0,
+      "hero_used": [
+        false,
+        false
+      ],
+      "athena_lock": false,
+      "adonis": null,
+      "winner": null,
+      "reason": ""
+    },
+    "seconds": 5,
+    "original_actions": [
+      {
+        "kind": "move",
+        "player": 0,
+        "worker": 0,
+        "source": 6,
+        "target": 10
+      },
+      {
+        "kind": "build",
+        "player": 0,
+        "worker": 0,
+        "source": 10,
+        "target": 6
+      }
+    ],
+    "candidate_actions_60s": [
+      {
+        "kind": "move",
+        "player": 0,
+        "worker": 1,
+        "source": 17,
+        "target": 21
+      },
+      {
+        "kind": "build",
+        "player": 0,
+        "worker": 1,
+        "source": 21,
+        "target": 17
+      }
+    ],
+    "evidence": {
+      "depth5_completion": 1.207940667,
+      "depth6_completion": 34.38263782,
+      "score_60s": -154
+    },
+    "note": "60-second alternative has not been proved winning; this is an evaluation-instability diagnostic."
+  }
+]

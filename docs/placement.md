@@ -1,6 +1,6 @@
 # Conseil de placement
 
-Après avoir choisi les deux pouvoirs et le premier joueur, le groupe Placement
+En mode **Partie contre robot**, après avoir choisi les deux pouvoirs et le premier joueur, le groupe Placement
 initial affiche l'ordre réglementaire de placement. Bia se place toujours en
 premier, sans changer le joueur qui commence ensuite à jouer.
 
@@ -43,14 +43,13 @@ court peut ne produire que le conseil géométrique ; ce cas est indiqué.
 
 ## Isolation de la QA
 
-Le code et la bibliothèque Rust compilée sont dans le worktree séparé
-`.worktrees/placement-advice/`. Aucun fichier d'application de la version
-principale, raccourci de bureau ou processus de la partie en cours n'est modifié.
+Le conseil de placement est intégré à `main`. Le worktree utilisé pendant son
+développement n’est pas nécessaire pour lancer ou modifier cette fonctionnalité.
 
 `preview_placement.sh` utilise `.preview-data/` et ajoute **Test placement** aux
 titres des fenêtres. Ses parties et archives sont indépendantes des sauvegardes
 de production. Pour conserver cette séparation, utilisez ce lanceur pour tester
-la branche, plutôt que le raccourci de bureau.
+une modification, plutôt que le raccourci de bureau.
 
 Captures : [configuration](placement-configuration.png),
 [analyse du placement](placement-analyse.png).

@@ -11,9 +11,18 @@
 - Moteur Python de référence : dix héros et dix-huit dieux avancés publics.
 - Vérification indépendante des tours proposés par Rust.
 - Sauvegarde après chaque modification validée, reprise, archive avec résultat.
-- Conseil de placement sur la branche `feature/placement-advice` : réponse au
+- Conseil de placement intégré à `main` : réponse au
   placement connu ou anticipation des réponses adverses, budget distinct, Bia,
   Eros et identité des pièces de Selene. Voir [placement.md](placement.md).
+
+## Amélioration stratégique après la première campagne
+
+Les 100 parties robot contre robot et leurs mesures sont conservées dans
+[la campagne de référence](../experiments/selfplay-100-5s-20261005/rapport.md).
+Les priorités, estimations de coût et critères de comparaison sont détaillés
+[dans le plan d’amélioration du moteur](ameliorations-moteur-20261005.md).
+Commencer par les mesures, l’évaluation des constructions et le tri tactique,
+puis décider des optimisations suivantes sur des comparaisons à 5 s par tour.
 
 ## Extension du moteur
 

@@ -1,22 +1,5 @@
 # Santoni
 
-## Tester la branche de conseil de placement
-
-Cette version est isolée sur `feature/placement-advice`, dans
-`.worktrees/placement-advice/`. Le raccourci de bureau reste associé à la version
-principale ; aucune bascule de l'application en cours n'est effectuée.
-
-Depuis le dossier de cette branche, lancez :
-
-```bash
-./preview_placement.sh
-```
-
-Les fenêtres portent la mention **Test placement**. Ce lanceur utilise ses propres
-sauvegardes dans `.preview-data/` : il ne reprend ni ne modifie la partie de la
-version principale. Les détails de cette fonctionnalité figurent dans
-[docs/placement.md](docs/placement.md).
-
 Application native Linux pour jouer à Santorini contre un moteur de recherche.
 Deux fenêtres PySide6, **Saisie** et **Analyse**, restent au-dessus des autres
 applications, comme dans Digitcode. Ctrl + molette règle leur opacité séparément.
@@ -168,3 +151,72 @@ les tours adverses sont saisis sans conseil. Ce mode est sauvegardé avec la
 partie. Les anciennes sauvegardes conservent le mode robot.
 Cocher une famille de pouvoirs affiche ses cartes sans les sélectionner :
 cochez individuellement les cartes disponibles pour constituer le choix.
+
+
+## Reprendre le travail sur un autre PC
+
+Tout le travail de l’ancien worktree de placement est intégré à la racine du
+dépôt. Un clone de `main` contient l’application, les outils de parties sans
+interface, les 100 parties de la première campagne et les documents d’analyse.
+Le dossier `.worktrees/` est une organisation locale de Git ; il n’est pas
+nécessaire de le copier ou de le recréer pour continuer.
+
+Sur Linux, avec Python 3.10+ et Rust/Cargo installés :
+
+```bash
+git clone git@github.com:MayoFaro/Santoni.git
+cd Santoni
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e . pytest
+cargo build --release --manifest-path native_engine/Cargo.toml
+./start_native.sh
+```
+
+Pour une prévisualisation avec des sauvegardes distinctes dans `.preview-data/` :
+
+```bash
+./preview_placement.sh
+```
+
+Les binaires Rust, environnements Python et caches sont reconstruits sur le
+nouveau PC. Le fichier `Santoni.desktop` contient le chemin de l’installation
+initiale : adapter ses champs `Exec` et `Path` avant de l’utiliser comme raccourci
+sur PC2. Les parties personnelles de l’application restent dans le dossier
+local de sauvegarde indiqué plus haut ; les parties expérimentales sont dans
+le dépôt.
+
+## Campagne robot contre robot et pistes d’amélioration
+
+- [Rapport des 100 parties à 5 secondes par tour](experiments/selfplay-100-5s-20261005/rapport.md).
+- [Axes d’amélioration et estimation coût / efficacité](docs/ameliorations-moteur-20261005.md).
+- [Positions critiques et variantes vérifiées](experiments/selfplay-100-5s-20261005/critical-positions.json).
+- `experiments/selfplay-100-5s-20261005/` conserve les 100 historiques, les mesures,
+  les réanalyses et la reprise qui inverse le vainqueur de la partie 16.
+
+Pour lancer une nouvelle campagne de 100 parties sans interface, utiliser un
+nouveau dossier de sortie et adapter le nombre de processus au PC :
+
+```bash
+python tools/selfplay.py --output experiments/selfplay-pc2 --seconds 5 --workers 4 --seed 20261005
+python tools/analyse_selfplay.py experiments/selfplay-pc2
+```
+
+Le banc de parties utilise le moteur Rust compilé et les règles Python pour
+valider les coups. Il fonctionne sans PySide6 ni fenêtre. Les temps et les coups
+peuvent varier entre machines malgré une même graine : le budget est temporel.
+
+Une campagne interrompue peut être relancée avec les mêmes paramètres et la
+même bibliothèque : les parties terminées sont conservées, les parties
+incomplètes repartent de leur placement initial. Les paramètres historiques et
+l’empreinte du moteur sont préservés pour éviter de mélanger plusieurs versions.
+
+Pour approfondir une position de la campagne initiale :
+
+```bash
+python tools/recheck_selfplay.py experiments/selfplay-100-5s-20261005 --cases 16:26 --seconds 20
+```
+
+`tools/report_selfplay.py` met en forme le rapport de la **première campagne** ;
+ses commentaires sur les parties 16 et 18 sont spécifiques à ces données.
+Utiliser `tools/analyse_selfplay.py` pour les mesures d’une nouvelle campagne.
