@@ -257,3 +257,96 @@ def test_human_opponent_receives_no_advice_and_my_turn_is_automatic(app, tmp_pat
     assert not restored.robot_game.isChecked()
     assert not restored.thinking and restored.advice is None
     dispose(app, restored)
+
+
+def test_arena_enables_families_without_selecting_cards_and_saves_mode(app, tmp_path):
+    from PySide6.QtCore import Qt
+    window = MainWindow(Store(tmp_path), restore=False)
+    window.arena_mode.setChecked(True)
+    assert all(box.isChecked() and not box.isEnabled() for box in window.families.values())
+    assert window.checked_powers() == []
+    window.positions = [6, 8, 16, 18]
+    window.start_game()
+    assert window.session is None
+    for index in range(window.available.count()):
+        item = window.available.item(index)
+        if item.data(Qt.UserRole) in (1, 2):
+            item.setCheckState(Qt.Checked)
+    window.mine.setCurrentIndex(window.mine.findData(1))
+    window.robot.setCurrentIndex(window.robot.findData(2))
+    window.start_game()
+    assert window.session.settings['rules_mode'] == 'arena'
+    assert window.store.load().settings['rules_mode'] == 'arena'
+    dispose(app, window)
+
+
+def test_action_and_worker_chips_are_exclusive_and_follow_draft_position(app, tmp_path):
+    from santorini.engine import next_actions
+    window = MainWindow(Store(tmp_path), restore=False)
+    # Feed legal actions directly to isolate input behaviour from subprocess timing.
+    window.launch = lambda *args, **kwargs: None
+    window.session = Session(Position())
+    window.actions_ready(next_actions(window.session.position), window.input_generation)
+    assert window.action_kind.currentData() == 'move'
+    assert window.action_kind.values[:2] == ['move', 'build']
+    assert not window.action_kind.buttons[1].isEnabled()
+    assert len(window.actor.buttons) == 2
+    window.actor.buttons[1].click()
+    assert window.actor.currentData() == (0, 1)
+    assert sum(b.isChecked() for b in window.actor.buttons) == 1
+    target = next(a.target for a in window.options if a.worker == 1 and a.kind == 'move')
+    window.coordinate_action(target)
+    window.actions_ready(next_actions(window.session.position, window.draft), window.input_generation)
+    assert window.action_kind.currentData() == 'build'
+    assert sum(b.isChecked() for b in window.action_kind.buttons) == 1
+    assert not window.action_kind.buttons[0].isEnabled()
+    assert window.actor.currentData() == (0, 1)
+    from santorini.engine import coord
+    assert coord(target) in window.actor.buttons[1].text()
+    assert not window.actor.buttons[0].isEnabled()
+    dispose(app, window)
+
+
+def test_arena_unchecked_restores_personal_family_choices(app, tmp_path):
+    window = MainWindow(Store(tmp_path), restore=False)
+    window.families['hero'].setChecked(True)
+    window.arena_mode.setChecked(True)
+    window.arena_mode.setChecked(False)
+    assert {k for k,v in window.families.items() if v.isChecked()} == {'hero'}
+    assert all(v.isEnabled() for v in window.families.values())
+    dispose(app, window)
+
+
+def test_optional_prebuild_and_move_icons_select_exclusively(app, tmp_path):
+    from santorini.engine import next_actions
+    window = MainWindow(Store(tmp_path), restore=False)
+    window.launch = lambda *a, **kwargs: None
+    window.session = Session(Position(powers=(10, 0)))
+    window.actions_ready(next_actions(window.session.position), window.input_generation)
+    assert all(b.isEnabled() for b in window.action_kind.buttons[:2])
+    window.action_kind.buttons[1].click()
+    assert window.action_kind.currentData() == 'build'
+    assert not window.action_kind.buttons[0].isChecked()
+    window.action_kind.buttons[0].click()
+    assert window.action_kind.currentData() == 'move'
+    assert not window.action_kind.buttons[1].isChecked()
+    dispose(app, window)
+
+
+def test_jason_new_worker_chip_updates_after_placement(app, tmp_path):
+    from santorini.engine import next_actions, coord
+    window = MainWindow(Store(tmp_path), restore=False)
+    window.launch = lambda *a, **kwargs: None
+    window.session = Session(Position(powers=(51, 0)))
+    window.actions_ready(next_actions(window.session.position), window.input_generation)
+    window.activate_hero()
+    window.actions_ready(next_actions(window.session.position, window.draft), window.input_generation)
+    assert window.action_kind.currentData() == 'place'
+    assert window.actor.currentData() == (0, 2)
+    target = next(a.target for a in window.options if a.kind == 'place')
+    window.coordinate_action(target)
+    window.actions_ready(next_actions(window.session.position, window.draft), window.input_generation)
+    assert window.action_kind.currentData() == 'build'
+    assert window.actor.currentData() == (0, 2)
+    assert coord(target) in window.actor.buttons[2].text()
+    dispose(app, window)

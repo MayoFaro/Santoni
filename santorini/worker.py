@@ -19,9 +19,17 @@ def _compute(kind, args, cancelled, publish):
         if end:
             budget = max(0.001, min(budget, end[0] - time.monotonic()))
         from .native import eligible, library_path, native_search
-        if eligible(position) and library_path().exists() and budget >= 0.01:
+        if eligible(position) and library_path().exists():
             return native_search(position, budget, cancelled=cancelled, publish=publish)
         return search(position, budget, cancelled=cancelled, publish=publish)
+    if kind=="secret_setup":
+        from .native import native_choose_secret
+        position,budget,*end=args
+        if end:budget=max(.001,min(budget,end[0]-time.monotonic()))
+        return native_choose_secret(position,budget,cancelled=cancelled)
+    if kind=="resolve":
+        from .engine import resolve_plan
+        return resolve_plan(*args)
     if kind == "correction":
         session, index, actions = args
         return session.correct(index, actions)
@@ -33,8 +41,11 @@ def _compute(kind, args, cancelled, publish):
         if end:
             budget = max(.1, min(budget, end[0] - time.monotonic()))
         return choose_placement(powers, first, budget, opponent,
-                                cancelled=cancelled, publish=publish)
+                                cancelled=cancelled, publish=publish,extra=end[1] if len(end)>1 else None)
     if kind == "actions":
+        from .native import eligible, library_path, native_next_actions
+        if eligible(args[0]) and library_path().exists():
+            return native_next_actions(*args, cancelled=cancelled)
         def check():
             if cancelled():
                 raise Interrupted

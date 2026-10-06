@@ -53,14 +53,21 @@ au moteur ; la recherche automatique concerne les tours du robot.
 
 ## Pouvoirs disponibles dans cette version
 
-- Les **10 dieux de base**, avec règles et recherche Rust.
-- Les **10 héros**, avec le moteur de référence Python dans un processus séparé.
-- **18 dieux avancés** : Aphrodite, Ares, Bia, Charon, Chronus, Eros, Hera,
-  Hestia, Hypnus, Limus, Medusa, Persephone, Poseidon, Selene, Triton, Zeus,
-  Hades et Urania, avec le moteur de référence.
-- Les **17 autres dieux avancés** sont visibles et grisés. Leurs règles ne sont
-  pas simulées : ils restent à implémenter, notamment les pouvoirs avec jetons,
-  tirages, vol de pouvoir, tours supplémentaires et informations secrètes.
+Les **55 pouvoirs** sont disponibles : 10 dieux de base, 35 dieux avancés et
+10 héros. Les règles et la recherche de coups sont exécutées en **Rust**, dans
+un processus indépendant de l’interface Python/Qt.
+
+Les 17 derniers pouvoirs ajoutés sont Chaos, Circé, Dionysos, Morphée, Éole,
+Charybde, Clio, Europe et Talos, Gaia, les Grées, les Harpies, Hécate, les Moires,
+Némésis, Sirène, Tartare et Terpsichore. La configuration propose leurs choix
+initiaux ; jetons, réserves, cartes tirées et interruptions sont sauvegardés.
+Les parties à information secrète utilisent une recherche sur des hypothèses,
+sans annoncer de victoire certaine issue de cette estimation.
+
+Voir [l’implémentation et ses limites](docs/all-powers-rust.md). Le mode Arène
+ouvre les trois familles sans Toison d’or, sans hasard ni information cachée
+(Chaos, Hecate, Moerae et Tartarus exclus, soit 51 pouvoirs) ; il ne prétend pas reproduire toutes
+les révisions de règles de Board Game Arena.
 
 La référence est [regle.pdf](regle.pdf), livret français de six pages ajouté au
 projet. Les associations N.R.C. connues du livret sont indiquées dans la
@@ -71,8 +78,7 @@ configuration, et les joueurs choisissent des pouvoirs distincts.
 Le moteur utilise minimax, alpha-bêta, approfondissement progressif, classement
 des coups et cache des positions. Un premier tour légal sert de secours ; chaque
 profondeur achevée peut améliorer le conseil. Les variantes avec beaucoup
-d'actions facultatives peuvent atteindre une profondeur plus faible, surtout
-dans le moteur Python.
+d'actions facultatives peuvent atteindre une profondeur plus faible, selon les pouvoirs en jeu.
 
 Le budget par tour est de **1 à 600 secondes** dans l'application. Le temps de
 création du processus est soustrait du budget. Un résultat complet est envoyé
@@ -121,11 +127,13 @@ QT_QPA_PLATFORM=offscreen python3 -m pytest -q
 Les tests couvrent les règles, les tours complets, les délais, les sauvegardes,
 l'interface et les résultats obsolètes. Ils comparent aussi les actions et
 positions du moteur Rust avec celles du moteur Python sur des positions
-ordinaires et générées, pour les dix dieux de base.
+ordinaires et générées, pour les 38 pouvoirs déjà disponibles. Les 17 nouveaux
+pouvoirs ont des scénarios de règles dédiés et des contrôles de sauvegarde/rejeu.
 
 ## Architecture et suite
 
-- `santorini/engine.py` : règles pures, états immuables, actions et validation.
+- `santorini/engine.py` : états immuables, actions, validation et référence des 38 premiers pouvoirs.
+- `santorini/extra.py` et `santorini/setup.py` : ressources et configuration des nouveaux pouvoirs.
 - `native_engine/` : moteur Rust, chargé uniquement dans un processus de calcul.
 - `santorini/search.py` : moteur de référence et comparaison des pouvoirs.
 - `santorini/worker.py` : processus annulables, résultats identifiés par position.
@@ -202,8 +210,9 @@ python tools/selfplay.py --output experiments/selfplay-pc2 --seconds 5 --workers
 python tools/analyse_selfplay.py experiments/selfplay-pc2
 ```
 
-Le banc de parties utilise le moteur Rust compilé et les règles Python pour
-valider les coups. Il fonctionne sans PySide6 ni fenêtre. Les temps et les coups
+Le banc de parties utilise le moteur Rust compilé. La validation compare les
+38 premiers pouvoirs à la référence Python ; les nouveaux états sont validés
+par les règles Rust. Il fonctionne sans PySide6 ni fenêtre. Les temps et les coups
 peuvent varier entre machines malgré une même graine : le budget est temporel.
 
 Une campagne interrompue peut être relancée avec les mêmes paramètres et la

@@ -6,17 +6,18 @@ import sys
 import time
 from dataclasses import replace
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+    QInputDialog, QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QHeaderView, QPushButton, QTabWidget, QTableWidget, QScrollArea,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QAbstractItemView,
 )
 
-from .engine import Action, Position, _apply, coord, validate_setup
-from .powers import POWERS, incompatible
+from .engine import Action, Position, _apply, coord, validate_setup, preview_position, resolve_plan
+from .extra import Extra, initial_count, DIRECTIONS
+from .powers import POWERS, incompatible, ARENA_EXCLUDED
 from .search import Analysis, PowerAdvice
 from .placement import PlacementAdvice, placement_first
 from .storage import Session, Store
@@ -30,6 +31,7 @@ QPushButton:hover { background: #dfeafa; }
 QPushButton:disabled { color: #8a919a; }
 QPushButton[chip="true"] { border-radius: 13px; min-width: 32px; min-height: 25px; background: #fff; color: #263443; }
 QPushButton[chip="true"]:checked { background: #263443; color: white; }
+QPushButton[chip="true"]:disabled { color: #939ba5; background: #f0f2f4; border-color: #d5d9df; }
 QPushButton[primary="true"] { background: #245f9b; color: white; font-weight: bold; }
 QPushButton[primary="true"]:disabled { background: #e4e7eb; color: #8a919a; border-color: #ccd0d5; }
 QGroupBox { font-weight: bold; margin-top: 9px; padding-top: 8px; }
@@ -42,6 +44,58 @@ def button(text, callback, primary=False):
     b.setProperty("primary", primary)
     b.clicked.connect(callback)
     return b
+
+
+class ButtonChoices(QWidget):
+    """Exclusive, keyboard-accessible choices with explicit legal availability."""
+    currentIndexChanged = Signal(int)
+
+    def __init__(self, columns=None):
+        super().__init__()
+        self.columns=columns
+        self.row = QGridLayout(self) if columns else QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons, self.values = [], []
+        self.index = -1
+        self.group.idClicked.connect(self.setCurrentIndex)
+
+    def clear(self):
+        for chip in self.buttons:
+            self.group.removeButton(chip)
+            self.row.removeWidget(chip)
+            chip.hide()
+            chip.deleteLater()
+        self.buttons, self.values, self.index = [], [], -1
+
+    def addItem(self, text, value, enabled=True, description=None):
+        chip = QPushButton(text)
+        chip.setCheckable(True)
+        chip.setProperty("chip", True)
+        chip.setEnabled(enabled)
+        chip.setAccessibleName(description or text)
+        chip.setToolTip(description or text)
+        index = len(self.buttons)
+        self.group.addButton(chip, index)
+        if self.columns:self.row.addWidget(chip,index//self.columns,index%self.columns)
+        else:self.row.addWidget(chip)
+        self.buttons.append(chip)
+        self.values.append(value)
+        if self.index < 0 and enabled:
+            self.setCurrentIndex(index)
+
+    def setCurrentIndex(self, index):
+        if not 0 <= index < len(self.buttons) or not self.buttons[index].isEnabled():
+            return
+        changed = self.index != index
+        self.index = index
+        self.buttons[index].setChecked(True)
+        if changed:
+            self.currentIndexChanged.emit(index)
+
+    def currentData(self):
+        return self.values[self.index] if self.index >= 0 else None
 
 
 class Coordinates(QWidget):
@@ -117,6 +171,15 @@ class BoardGrid(QTableWidget):
             if occupants:
                 p, i = occupants[0]
                 text += f"\n{'M' if p == 0 else getattr(self, 'opponent_tag', 'R')}{i + 1}"
+            markers=[]
+            for owner in (0,1):
+                if s.extra.coins[owner]&(1<<cell):markers.append("Pièce")
+                if cell in s.extra.whirlpools[owner]:markers.append(f"Tourbillon {owner+1}")
+                if s.extra.talus[owner]==cell:markers.append("Talus")
+                if s.extra.abyss[owner]==cell:markers.append("Abysse privé")
+                zone=s.extra.fate[owner]
+                if zone>=0 and cell%5 in (zone%5,zone%5+1) and cell//5 in (zone//5,zone//5+1):markers.append("Destin privé")
+            if markers:text+="\n"+" · ".join(markers)
             item = QTableWidgetItem(text)
             item.setTextAlignment(Qt.AlignCenter)
             item.setToolTip(f"{coord(cell)} : niveau {s.heights[cell]}" + (", dôme" if s.domes & (1 << cell) else ""))
@@ -263,6 +326,10 @@ class MainWindow(QMainWindow):
         self.thinking_started = 0
         self.budget_used = 0
         self.positions = [-1] * 4
+        self.setup_counts=(2,2)
+        self.setup_extra=Extra()
+        self.setup_pair=None
+        self.setup_thinking=False
         preview = os.environ.get("SANTONI_PREVIEW_LABEL")
         self.setWindowTitle("Santoni — Saisie" + (f" [{preview}]" if preview else ""))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
@@ -320,6 +387,11 @@ class MainWindow(QMainWindow):
         self.robot_game.setChecked(False)
         self.robot_game.toggled.connect(self.mode_changed)
         layout.addWidget(self.robot_game)
+        self.arena_mode = QCheckBox("Mode Arène — information parfaite")
+        self.arena_mode.setToolTip("Sans Toison d’or, hasard ni information cachée : Chaos, Hecate, Moerae et Tartarus sont exclus. Choisissez les cartes disponibles, puis le pouvoir de chaque joueur.")
+        self.arena_mode.toggled.connect(self.arena_changed)
+        self.pre_arena_families = None
+        layout.addWidget(self.arena_mode)
         row = QHBoxLayout()
         self.families = {}
         for key, text in [("basic", "Dieux de base"), ("hero", "Pouvoirs de héros"), ("advanced", "Dieux avancés")]:
@@ -417,6 +489,11 @@ class MainWindow(QMainWindow):
         self.turn_label = QLabel("Aucune partie en cours.")
         self.turn_label.setWordWrap(True)
         layout.addWidget(self.turn_label)
+        self.private_turn=QCheckBox("Vue privée de l’adversaire")
+        self.private_turn.setToolTip("Passer l’écran à l’adversaire pour saisir ses déplacements secrets.")
+        self.private_turn.toggled.connect(self.private_view_changed)
+        self.private_turn.hide()
+        layout.addWidget(self.private_turn)
         self.board = Board()
         self.board.table.setMinimumHeight(185)
         self.board.table.setMaximumHeight(225)
@@ -427,14 +504,18 @@ class MainWindow(QMainWindow):
         self.prompt.setWordWrap(True)
         layout.addWidget(self.prompt)
         row = QHBoxLayout()
-        self.action_kind = QComboBox()
-        self.actor = QComboBox()
+        self.action_kind = ButtonChoices()
+        self.actor = ButtonChoices(columns=2)
         self.action_kind.currentIndexChanged.connect(self.update_actors)
         self.actor.currentIndexChanged.connect(self.update_coordinates)
         row.addWidget(self.action_kind)
         row.addWidget(self.actor)
         layout.addLayout(row)
+        self.event_choices=QWidget()
+        QGridLayout(self.event_choices)
+        self.event_choices.hide()
         self.coordinates = Coordinates(self.coordinate_action)
+        layout.addWidget(self.event_choices)
         layout.addWidget(self.coordinates)
         self.special = button("Utiliser le pouvoir de héros", self.activate_hero)
         layout.addWidget(self.special)
@@ -517,8 +598,9 @@ class MainWindow(QMainWindow):
         name = self.opponent_name()
         self.opponent_power_label.setText(f"Pouvoir {'du robot' if self.robot_mode() else 'de l’adversaire'}")
         self.first.setItemText(1, name)
-        self.slot.setItemText(2, f"{name} 1")
-        self.slot.setItemText(3, f"{name} 2")
+        for i in range(self.slot.count()):
+            owner,worker=self.setup_slot(i)
+            self.slot.setItemText(i,f"{'Moi' if owner==0 else name} {worker+1}")
         self.choose_for.setItemText(0, name)
         if not self.robot_mode():
             self.choose_for.setCurrentIndex(1)
@@ -531,9 +613,20 @@ class MainWindow(QMainWindow):
         self.placement_budget.setEnabled(self.robot_mode())
         self.available_changed()
 
+    def arena_changed(self, checked):
+        if checked:
+            self.pre_arena_families = {key: box.isChecked() for key, box in self.families.items()}
+        for key, box in self.families.items():
+            box.blockSignals(True)
+            box.setChecked(True if checked else (self.pre_arena_families or {}).get(key, False))
+            box.setEnabled(not checked)
+            box.blockSignals(False)
+        self.refresh_configuration()
+
     def checked_powers(self):
         return [self.available.item(i).data(Qt.UserRole) for i in range(self.available.count())
-                if self.available.item(i).checkState() == Qt.Checked]
+                if self.available.item(i).checkState() == Qt.Checked
+                and (not self.arena_mode.isChecked() or self.available.item(i).data(Qt.UserRole) not in ARENA_EXCLUDED)]
 
     def refresh_configuration(self, *_):
         if not hasattr(self, "analysis"):
@@ -544,6 +637,8 @@ class MainWindow(QMainWindow):
         self.available.clear()
         for p in POWERS.values():
             if p.number == 0 or not self.families[p.family].isChecked():
+                continue
+            if self.arena_mode.isChecked() and p.number in ARENA_EXCLUDED:
                 continue
             item = QListWidgetItem(f"{p.number}. {p.name}" + (" — à venir" if not p.supported else ""))
             item.setData(Qt.UserRole, p.number)
@@ -577,9 +672,76 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
         self.configuration_changed()
 
+    def setup_slot(self,index):
+        split=getattr(self,"setup_counts",(2,2))[0]
+        return (0,index) if index<split else (1,index-split)
+
+    def resize_setup(self,counts):
+        if counts==self.setup_counts:return
+        old=self.setup_counts[0]
+        groups=(self.positions[:old],self.positions[old:])
+        self.positions=[v for owner,count in enumerate(counts) for v in (groups[owner]+[-1]*count)[:count]]
+        self.setup_counts=counts
+        self.slot.blockSignals(True);self.slot.clear()
+        self.slot.addItems([f"{'Moi' if owner==0 else self.opponent_name()} {w+1}" for owner,count in enumerate(counts) for w in range(count)])
+        self.slot.blockSignals(False)
+
+    def setup_parameters(self,powers,workers,public_only=False):
+        extra=self.setup_extra
+        labels={6:"↙ Sud-ouest",7:"↓ Sud",8:"↘ Sud-est",11:"← Ouest",13:"→ Est",16:"↖ Nord-ouest",17:"↑ Nord",18:"↗ Nord-est"}
+        for owner,power in enumerate(powers):
+            name="Moi" if owner==0 else self.opponent_name()
+            def choose(title,cells,names=None):
+                values=[names[c] if names else coord(c) for c in cells]
+                text,ok=QInputDialog.getItem(self,title,name,values,0,False)
+                return cells[values.index(text)] if ok else None
+            if power in (31,42):
+                if power==31 and extra.wind in DIRECTIONS or power==42 and extra.siren[owner] in DIRECTIONS:continue
+                direction=choose("Direction initiale du vent" if power==31 else "Direction du chant",list(DIRECTIONS),labels)
+                if direction is None:return None
+                if power==31:extra=replace(extra,wind=direction)
+                else:
+                    dirs=list(extra.siren);dirs[owner]=direction;extra=replace(extra,siren=tuple(dirs))
+            elif power==14:
+                if extra.chaos[owner]:continue
+                cards=[n for n in range(1,11) if n!=powers[1-owner]]
+                card=choose("Première carte effectivement tirée par Chaos",cards,{n:POWERS[n].name for n in cards})
+                if card is None:return None
+                revealed=list(extra.chaos);revealed[owner]=card;extra=replace(extra,chaos=tuple(revealed))
+            elif power in (40,43) and not public_only:
+                cells=[c for c in range(20) if c%5!=4] if power==40 else [c for c in range(25) if all(c not in ws for ws in workers)]
+                if owner==1 and self.robot_mode():
+                    cell=cells[0]
+                else:
+                    cell=choose("Zone secrète : coin inférieur gauche" if power==40 else "Case secrète de l’abysse",cells)
+                    if cell is None:return None
+                values=list(extra.fate if power==40 else extra.abyss);values[owner]=cell
+                extra=replace(extra,**{ "fate" if power==40 else "abyss":tuple(values)})
+        self.setup_extra=extra
+        return extra
+
+    def visible_position(self,pos):
+        if pos.powers[1]==39 and not (hasattr(self,"private_turn") and self.private_turn.isChecked() and pos.player==1 and not self.robot_mode()):
+            pos=replace(pos,workers=(pos.workers[0],(-1,)*len(pos.workers[1])))
+        extra=replace(pos.extra,abyss=(pos.extra.abyss[0],-1),fate=(pos.extra.fate[0],-1))
+        return replace(pos,extra=extra)
+
+    def private_view_changed(self,*_):
+        self.refresh();self.request_actions()
+
+    def public_highlights(self,actions,pos):
+        return {c for a in actions for c in (() if a.kind in ("sing","hidden_move","swap_hidden") or a.kind=="adonis" and a.source<0 else (a.target,) if pos.powers[1]==39 and a.player==1 and a.kind in ("build","dome","hidden_build") else () if pos.powers[1]==39 and a.player==1 else (a.source,a.target)) if c>=0}
+
+    def public_description(self,turn,before):
+        if before.powers[1]!=39:return self.display_turn(turn.description(before))
+        return " ; ".join(self.display_turn(a.label()) for a in turn.actions if not (a.player==1 and a.kind in ("move","force","place"))) or "Déplacement secret"
+
     def configuration_changed(self, *_):
         if not hasattr(self, "analysis"):
             return
+        self.cancel("secret_setup")
+        self.setup_thinking=False
+        if hasattr(self,"start_button"):self.start_button.setEnabled(self.session is None and not self.loading and not self.load_failed)
         self.invalidate_placement()
         self.power_generation += 1
         self.cancel("power")
@@ -591,7 +753,10 @@ class MainWindow(QMainWindow):
         mine, robot = self.mine.currentData(), self.robot.currentData()
         if mine is None or robot is None:
             return
-        self.power_detail.setText(f"Moi : {POWERS[mine].description}\nRobot : {POWERS[robot].description if robot >= 0 else 'Pouvoir à choisir.'}")
+        if (mine,robot)!=self.setup_pair:
+            self.setup_extra=Extra();self.setup_pair=(mine,robot)
+        self.resize_setup((initial_count(mine),initial_count(robot)))
+        self.power_detail.setText(f"Moi : {POWERS[mine].description}\n{self.opponent_name()} : {POWERS[robot].description if robot >= 0 else 'Pouvoir à choisir.'}")
         messages = []
         if robot >= 0 and incompatible(mine, robot):
             messages.append("Association non recommandée dans le règlement.")
@@ -603,14 +768,14 @@ class MainWindow(QMainWindow):
             messages.append("Eros : placer les deux bâtisseurs sur deux bords opposés.")
         self.match_warning.setText("\n".join(messages))
         if all(v < 0 for v in self.positions):
-            first = 0 if mine == 13 else 1 if robot == 13 else self.first.currentIndex()
-            self.slot.setCurrentIndex(first * 2)
+            first = placement_first((mine,robot),self.first.currentIndex())
+            self.slot.setCurrentIndex(0 if first==0 else self.setup_counts[0])
         self.render_placement()
 
     def render_placement(self, *_):
         if not hasattr(self, "placement"):
             return
-        self.placement_label.setText(" · ".join(f"{'M' if i < 2 else 'R' if self.robot_mode() else 'A'}{i % 2 + 1} : {coord(v) if v >= 0 else '…'}" for i, v in enumerate(self.positions)))
+        self.placement_label.setText(" · ".join(f"{'M' if owner==0 else 'R' if self.robot_mode() else 'A'}{worker+1} : {'secret' if owner==1 and self.robot.currentData()==39 else coord(v) if v>=0 else '…'}" for i,v in enumerate(self.positions) for owner,worker in [self.setup_slot(i)]))
         selected = self.slot.currentIndex()
         taken = {v for i, v in enumerate(self.positions) if i != selected and v >= 0}
         self.placement.set_allowed(set(range(25)) - taken)
@@ -629,10 +794,14 @@ class MainWindow(QMainWindow):
     def place(self, cell):
         self.invalidate_placement()
         index = self.slot.currentIndex()
+        if self.setup_slot(index)[0]==1 and self.robot.currentData()==39 and self.robot_mode():
+            self.fail("Hecate se place secrètement : utilisez la suggestion de placement du robot.")
+            return
         self.positions[index] = cell
         mine, robot = self.mine.currentData(), self.robot.currentData()
-        first = (0 if mine == 13 else 1 if robot == 13 else self.first.currentIndex())
-        order = [first * 2, first * 2 + 1, (1 - first) * 2, (1 - first) * 2 + 1]
+        first=placement_first((mine,robot),self.first.currentIndex())
+        groups=(list(range(self.setup_counts[0])),list(range(self.setup_counts[0],sum(self.setup_counts))))
+        order=groups[first]+groups[1-first]
         missing = [i for i in order if self.positions[i] < 0]
         if missing:
             self.slot.setCurrentIndex(missing[0])
@@ -670,6 +839,7 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.session = session
         if session:
+            self.arena_mode.setChecked(session.settings.get("rules_mode", "custom") == "arena")
             self.robot_game.setChecked(session.settings.get("robot_mode", True))
             self.mode_changed()
             self.game_budget.setValue(session.settings.get("move_seconds", 5))
@@ -688,23 +858,55 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def start_game(self):
-        if self.loading or self.load_failed or self.session is not None:
+        if self.loading or self.load_failed or self.session is not None or self.setup_thinking:
             return
         try:
             robot = self.robot.currentData()
             if robot < 0:
                 raise ValueError("Choisissez le pouvoir du robot ou lancez sa comparaison.")
-            pos = validate_setup((self.positions[:2], self.positions[2:]),
-                                 (self.mine.currentData(), robot), self.first.currentIndex())
-            settings = {"robot_mode": self.robot_game.isChecked(), "move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
+            if self.arena_mode.isChecked() and (self.mine.currentData() == 0 or robot == 0):
+                raise ValueError("En mode Arena, choisissez un pouvoir pour chaque joueur.")
+            powers=(self.mine.currentData(),robot)
+            if self.arena_mode.isChecked() and ARENA_EXCLUDED.intersection(powers):
+                raise ValueError("Le mode Arène exclut les pouvoirs aléatoires ou à information cachée.")
+            split=self.setup_counts[0]
+            workers=(tuple(self.positions[:split]),tuple(self.positions[split:]))
+            if any(c<0 for ws in workers for c in ws):raise ValueError("Placez tous les bâtisseurs avant de démarrer.")
+            extra=self.setup_parameters(powers,workers)
+            if extra is None:return
+            pos = validate_setup(workers,powers,self.first.currentIndex(),extra)
+            settings = {"rules_mode": "arena" if self.arena_mode.isChecked() else "custom",
+                        "robot_mode": self.robot_game.isChecked(), "move_seconds": self.move_budget.value(), "power_seconds": self.power_budget.value(),
                         "placement_seconds": self.placement_budget.value(),
                         "available_powers": self.checked_powers(),
                         "families": {k: b.isChecked() for k, b in self.families.items()}}
+            if self.robot_mode() and robot in (40,43):
+                self.setup_thinking=True;self.setup_pending_settings=settings
+                budget=self.placement_budget.value()
+                self.footer.setText("Recherche du lieu secret du robot…")
+                self.start_button.setEnabled(False)
+                self.launch("secret_setup",(pos,budget,time.monotonic()+budget),self.power_generation,self.secret_setup_ready,error=self.secret_setup_error)
+                return
             session = Session(pos, settings=settings)
             self.store.save(session)
         except (ValueError, OSError) as exc:
             self.fail(exc)
             return
+        self.install_session(session)
+
+    def secret_setup_ready(self,pos,token):
+        if token!=self.power_generation or self.session is not None:return
+        self.setup_thinking=False
+        try:
+            session=Session(pos,settings=self.setup_pending_settings);self.store.save(session)
+        except (ValueError,OSError) as exc:self.secret_setup_error(str(exc),token);return
+        self.install_session(session)
+
+    def secret_setup_error(self,message,token):
+        if token==self.power_generation:
+            self.setup_thinking=False;self.fail(message);self.refresh()
+
+    def install_session(self,session):
         self.clear_error()
         self.power_generation += 1
         self.cancel("power")
@@ -720,11 +922,12 @@ class MainWindow(QMainWindow):
         editing = self.correction_original is not None
         playing = active and self.session.result is None and not self.correction_busy
         self.cancel_correction_button.setVisible(editing)
-        self.commit_button.setText("Enregistrer le correctif" if editing else "Valider le tour / terminer")
+        self.commit_button.setText("Enregistrer le correctif" if editing else "Valider les actions — intervention de Gaea" if self.complete and self.complete.after.extra.event==2 else "Valider le tour / terminer")
         self.update_correction_controls()
         self.robot_game.setEnabled(not active)
+        self.arena_mode.setEnabled(not active)
         self.tabs.setTabEnabled(0, not active)
-        self.start_button.setEnabled(not active and not self.loading and not self.load_failed)
+        self.start_button.setEnabled(not active and not self.loading and not self.load_failed and not self.setup_thinking)
         self.undo_button.setEnabled(active and bool(self.session.history) and not editing)
         self.rethink.setEnabled(playing and not editing and (self.robot_mode() or self.session.position.player == 0))
         self.end_button.setEnabled(playing and not editing)
@@ -739,13 +942,28 @@ class MainWindow(QMainWindow):
             self.special.hide()
             return
         pos = self.session.position
+        self.private_turn.setVisible(pos.powers[1]==39 and pos.player==1 and not self.robot_mode())
         preview = pos
-        for a in self.draft:
-            preview = _apply(preview, a)
+        preview=preview_position(pos,self.draft)
         shown = self.draft or (self.advice.turn.actions if self.advice and self.advice.turn else ())
         self.board.table.opponent_tag = "R" if self.robot_mode() else "A"
-        self.board.render_position(preview, {cell for a in shown for cell in (a.source, a.target) if cell >= 0})
+        self.board.render_position(self.visible_position(preview),self.public_highlights(shown,pos))
         powers = f"Moi : {POWERS[pos.powers[0]].name} · {self.opponent_name()} : {POWERS[pos.powers[1]].name}"
+        resources=[]
+        for owner,power in enumerate(pos.powers):
+            if power==14:resources.append(f"Chaos : {POWERS[pos.extra.chaos[owner]].name}")
+            if power==25:resources.append(f"Morpheus : {pos.extra.materials[owner]} matériau(x)")
+            if power==35:resources.append(f"Gaea : {pos.extra.reserves[owner]} réserve(s)")
+        if pos.extra.wind>=0:resources.append(f"Vent : {coord(pos.extra.wind)} depuis C3")
+        for owner,direction in enumerate(pos.extra.siren):
+            if direction>=0:resources.append(f"Siren : {coord(direction)} depuis C3")
+        if resources:powers+="\n"+" · ".join(resources)
+        if pos.extra.dion_owner>=0:powers+="\nTour supplémentaire de Dionysus : contrôler un bâtisseur adverse ; aucune victoire pendant ce tour."
+        if pos.extra.event==2:powers+="\nIntervention de Gaea ; le tour interrompu reprendra ensuite."
+        if pos.extra.event==1:powers+="\nChaos : indiquez la carte réellement tirée."
+        if pos.extra.event==3:powers+="\nDionysus : choisir de jouer ou de renoncer au tour supplémentaire."
+        if self.session.settings.get("rules_mode") == "arena":
+            powers = "Arena · " + powers
         if self.session.result:
             outcome = self.session.result
             winner = outcome.get("winner")
@@ -755,14 +973,14 @@ class MainWindow(QMainWindow):
         if editing:
             self.turn_label.setText(f"Correction du tour {self.correction_index + 1} — "
                                     f"{'Moi' if pos.player == 0 else self.opponent_name()}\n{powers}")
-        self.draft_text.setText("\n".join(self.display_turn(a.label()) for a in self.draft) or "Aucune action saisie.")
+        self.draft_text.setText("\n".join(self.display_turn(a.label()) for a in self.draft if not (pos.powers[1]==39 and a.player==1 and a.kind in ("move","force","place"))) or "Aucune action saisie.")
         history_session = self.correction_original or self.session
         selected = self.history.currentRow()
         self.history.blockSignals(True)
         self.history.clear()
         for i, t in enumerate(history_session.history):
             before = history_session.initial if i == 0 else history_session.history[i - 1].after
-            self.history.addItem(f"{i + 1}. {'Moi' if before.player == 0 else self.opponent_name()}\n{self.display_turn(t.description(before))}\n{self.display_turn(t.power_summary(before))}")
+            self.history.addItem(f"{i + 1}. {'Moi' if before.player == 0 else self.opponent_name()}\n{self.public_description(t,before)}\n{self.display_turn(t.power_summary(before))}")
         if history_session.result:
             self.history.addItem(f"Résultat : {history_session.result}")
         self.history.setCurrentRow(selected)
@@ -770,6 +988,7 @@ class MainWindow(QMainWindow):
         self.update_correction_controls()
 
     def position_changed(self):
+        self.private_turn.blockSignals(True);self.private_turn.setChecked(False);self.private_turn.blockSignals(False)
         self.generation += 1
         self.cancel("search")
         self.cancel("actions")
@@ -801,6 +1020,7 @@ class MainWindow(QMainWindow):
     def request_actions(self):
         self.input_generation += 1
         self.options, self.complete = [], None
+        self.event_choices.hide()
         self.coordinates.set_allowed(set())
         self.action_kind.clear()
         self.actor.clear()
@@ -809,6 +1029,9 @@ class MainWindow(QMainWindow):
         if not self.session or self.session.result or self.correction_busy:
             return
         self.prompt.setText("Vérification des actions légales… La saisie reste indépendante de l'analyse.")
+        if self.session.position.player==1 and self.session.position.powers[1]==39 and (self.robot_mode() or not self.private_turn.isChecked()):
+            self.prompt.setText("Tour secret du robot : seul son résultat public sera affiché." if self.robot_mode() else "Passer l’écran à l’adversaire et activer sa vue privée pour saisir son tour secret.")
+            return
         self.launch("actions", (self.session.position, self.draft), self.input_generation,
                     self.actions_ready, error=self.actions_error)
 
@@ -827,35 +1050,71 @@ class MainWindow(QMainWindow):
             return
         kinds = sorted({a.kind for a in self.options if a.kind != "activate"})
         names = {"move": "Déplacement", "build": "Construction", "dome": "Dôme", "remove": "Retirer un bloc",
-                 "kill": "Éliminer", "force": "Déplacement forcé", "place": "Nouveau bâtisseur", "adonis": "Cible d'Adonis"}
+                 "kill": "Éliminer", "force": "Déplacement forcé", "place": "Nouveau bâtisseur", "adonis": "Cible d'Adonis", "wind":"Direction du vent", "whirlpool":"Placer un tourbillon", "talus":"Déplacer Talus", "swap":"Échanger avec un adversaire", "draw":"Carte tirée par Chaos", "decline":"Renoncer à l’intervention", "extra_turn":"Accepter le tour supplémentaire", "sing":"Chant sur un bâtisseur secret", "hidden_move":"Direction du déplacement caché", "hidden_build":"Construction avec un bâtisseur caché", "swap_hidden":"Échanger avec un bâtisseur secret", "probe_kill":"Désigner une case à éliminer", "probe_remove":"Retirer sous un bâtisseur secret", "probe_force":"Forcer un bâtisseur secret vers un coin", "probe_charon":"Forcer derrière mon bâtisseur"}
         self.action_kind.blockSignals(True)
         self.action_kind.clear()
-        for kind in kinds:
-            self.action_kind.addItem(names.get(kind, kind), kind)
+        symbols = {"move": "↗", "build": "▦", "dome": "◉", "remove": "−",
+                   "kill": "×", "force": "⇢", "place": "+", "adonis": "◎", "wind":"➤", "whirlpool":"↻", "talus":"◆", "swap":"⇄", "draw":"?", "decline":"✓", "extra_turn":"⏩", "sing":"♪", "hidden_move":"↗?", "hidden_build":"▦?", "swap_hidden":"⇄?", "probe_kill":"×?", "probe_remove":"−?", "probe_force":"⇢?", "probe_charon":"⇢?"}
+        for kind in ["move", "build"] + [k for k in kinds if k not in ("move", "build")]:
+            self.action_kind.addItem(symbols.get(kind, kind), kind, enabled=kind in kinds,
+                                     description=names.get(kind, kind))
         self.action_kind.blockSignals(False)
         self.special.setVisible(any(a.kind == "activate" for a in self.options))
-        self.prompt.setText("Tour complet : validez, ou poursuivez avec une action facultative." if self.complete else
+        self.prompt.setText("Validez les actions pour laisser Gaea intervenir. Le tour reprendra après sa réponse." if self.complete and self.complete.after.extra.event==2 else "Tour complet : validez, ou poursuivez avec une action facultative." if self.complete else
                             "Choisissez l'action et le bâtisseur, puis la lettre et le nombre de la case cible.")
         self.update_actors()
         self.refresh()
 
     def update_actors(self, *_):
+        previous = self.actor.currentData()
         self.actor.blockSignals(True)
         self.actor.clear()
         kind = self.action_kind.currentData()
-        pairs = sorted({(a.player, a.worker) for a in self.options if a.kind == kind})
-        for player, worker in pairs:
-            source = next(a.source for a in self.options if a.kind == kind and (a.player, a.worker) == (player, worker))
+        available = {(a.player, a.worker) for a in self.options if a.kind == kind}
+        preview = self.session.position if self.session else None
+        if preview:preview=preview_position(preview,self.draft)
+        players = ({p for p, w in available} or {preview.player}) if preview else set()
+        pairs = {(p, w) for p in players for w in range(len(preview.workers[p]))
+                 if preview and preview.workers[p][w] >= 0} | available
+        for player, worker in sorted(pairs):
+            source = next((a.source for a in self.options
+                           if a.kind == kind and (a.player, a.worker) == (player, worker)),
+                          preview.workers[player][worker]
+                          if preview and 0 <= worker < len(preview.workers[player]) else -1)
+            if preview and preview.powers[player]==39 and player!=0 and not self.private_turn.isChecked():source=-1
             text = "Cases adjacentes" if worker < 0 else f"{'Moi' if player == 0 else self.opponent_name()} {worker + 1}"
             if source >= 0:
-                text += f" ({coord(source)})"
-            self.actor.addItem(text, (player, worker))
+                text += f" · {coord(source)}"
+            self.actor.addItem(text, (player, worker), enabled=(player, worker) in available)
+        if previous in self.actor.values:
+            self.actor.setCurrentIndex(self.actor.values.index(previous))
         self.actor.blockSignals(False)
         self.update_coordinates()
 
     def update_coordinates(self, *_):
         kind, actor = self.action_kind.currentData(), self.actor.currentData()
+        self.special.setVisible(any(a.kind in ("activate","decline","extra_turn","sing") for a in self.options))
+        special=next((a for a in self.options if a.kind==kind and (a.player,a.worker)==actor and (a.kind in ("decline","extra_turn","sing") or a.kind=="adonis" and a.source<0)),None)
+        if special:self.special.setVisible(True)
+        self.special.setVisible(special is not None or any(a.kind=="activate" for a in self.options))
+        self.special.setText("Renoncer" if special and special.kind=="decline" else "Tour supplémentaire" if special and special.kind=="extra_turn" else "Chanter" if special and special.kind=="sing" else "Désigner ce bâtisseur" if special and special.kind=="adonis" else "Utiliser le héros")
         cells = {a.target for a in self.options if a.kind == kind and (a.player, a.worker) == actor and a.target >= 0}
+        if kind in ("decline","extra_turn","sing") or special and special.kind=="adonis":cells=set()
+        named = [a for a in self.options if a.kind == kind and
+                 (kind == "draw" or (a.player, a.worker) == actor)] if kind in ("draw", "swap_hidden") else []
+        layout = self.event_choices.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        for i, action in enumerate(named):
+            label = POWERS[action.target].name if kind == "draw" else f"Adversaire {action.target + 1}"
+            chip = button(label, lambda checked=False, a=action: self.enter_event(a))
+            layout.addWidget(chip, i // 3, i % 3)
+        self.event_choices.setVisible(bool(named))
+        self.coordinates.setVisible(kind not in ("draw", "swap_hidden"))
+        self.actor.setVisible(kind != "draw")
+        if kind in ("draw", "swap_hidden"): cells = set()
+        if kind=="hidden_move":self.prompt.setText("Direction du déplacement caché : choisir une case voisine de C3, utilisée comme repère.")
         self.coordinates.set_allowed(cells)
 
     def coordinate_action(self, cell):
@@ -865,8 +1124,14 @@ class MainWindow(QMainWindow):
             self.draft += (action,)
             self.request_actions()
 
+    def enter_event(self,action):
+        if action not in self.options:return
+        self.draft+=(action,);self.request_actions()
+
     def activate_hero(self):
-        action = next((a for a in self.options if a.kind == "activate"), None)
+        selected=self.action_kind.currentData()
+        actor=self.actor.currentData()
+        action = next((a for a in self.options if a.kind==selected and (a.player,a.worker)==actor and (a.kind in ("decline","extra_turn","sing") or a.kind=="adonis" and a.source<0)),None) or next((a for a in self.options if a.kind == "activate"), None)
         if action:
             self.draft += (action,)
             self.request_actions()
@@ -1013,7 +1278,7 @@ class MainWindow(QMainWindow):
 
     def show_analysis(self, analysis: Analysis):
         self.advice = analysis
-        self.analysis.move_label.setText((self.display_turn(analysis.turn.description(self.session.position)) + "\n" + analysis.turn.power_summary(self.session.position))
+        self.analysis.move_label.setText((self.public_description(analysis.turn,self.session.position) + "\n" + analysis.turn.power_summary(self.session.position))
                                    if analysis.turn and self.session else analysis.status)
         proof = "Démontré" if analysis.proven else "Estimation" if analysis.score is not None else "Sans évaluation"
         score = "…" if analysis.score is None else str(analysis.score)
@@ -1023,6 +1288,8 @@ class MainWindow(QMainWindow):
                                        (f" · recherche à profondeur {analysis.searching_depth}" if analysis.searching_depth and self.thinking else ""))
         if analysis.proven:
             explanation = analysis.status
+        elif analysis.turn and analysis.turn.after.extra.event==2:
+            explanation="Gaea intervient immédiatement. La suite du déplacement ou de la construction dépendra de sa réponse."
         elif analysis.turn:
             used = any(a.kind == "activate" for a in analysis.turn.actions)
             explanation = "Le moteur compare les réponses adverses en privilégiant les menaces de victoire, la mobilité et l'accès aux étages."
@@ -1034,16 +1301,21 @@ class MainWindow(QMainWindow):
         lines = []
         before = self.session.position if self.session else None
         for i, turn in enumerate(analysis.variation):
-            lines.append(f"{i + 1}. {self.display_turn(turn.description(before) if before else turn.label())}")
+            lines.append(f"{i + 1}. {self.public_description(turn,before) if before else turn.label()}")
             before = turn.after
         self.analysis.variation.setPlainText("\n\n".join(lines) or "Pas encore de variante calculée.")
         if self.session and not self.draft and analysis.turn:
-            self.board.render_position(self.session.position,
-                                       {cell for a in analysis.turn.actions for cell in (a.source, a.target) if cell >= 0})
+            self.board.render_position(self.visible_position(self.session.position),self.public_highlights(analysis.turn.actions,self.session.position))
 
     def play_advice(self):
         if self.advice and self.advice.turn and not self.thinking and self.session and self.session.result is None:
-            self.commit(self.advice.turn)
+            if self.advice.turn.after.extra.view:
+                self.analysis.apply.setEnabled(False)
+                self.launch("resolve",(self.session.position,self.advice.turn.actions),self.generation,self.resolved_ready,error=self.search_error)
+            else:self.commit(self.advice.turn)
+
+    def resolved_ready(self,turn,token):
+        if token==self.generation and self.session and self.session.result is None:self.commit(turn)
 
     def finish_loss(self):
         if not self.session or self.session.result:
@@ -1110,6 +1382,10 @@ class MainWindow(QMainWindow):
         self.draft_text.clear()
         self.prompt.setText("Choisissez une configuration.")
         self.positions = [-1] * 4
+        self.setup_counts=(2,2)
+        self.setup_extra=Extra()
+        self.setup_pair=None
+        self.setup_thinking=False
         self.tabs.setCurrentIndex(0)
         self.footer.setText(f"Archive : {archive}" if archive else "Nouvelle partie.")
         self.clear_error()
@@ -1182,10 +1458,12 @@ class MainWindow(QMainWindow):
             self.fail("Choisissez d'abord les deux pouvoirs, y compris celui du robot.")
             return
         first = placement_first(powers, self.first.currentIndex())
-        opponent = tuple(self.positions[:2]) if first == 0 else None
-        if opponent and (any(c < 0 for c in opponent) or len(set(opponent)) != 2):
+        opponent = tuple(self.positions[:self.setup_counts[0]]) if first == 0 else None
+        if opponent and (any(c < 0 for c in opponent) or len(set(opponent)) != self.setup_counts[0]):
             self.fail("Vous vous placez en premier : saisissez vos deux bâtisseurs avant de demander le placement du robot.")
             return
+        extra=self.setup_parameters(powers,(self.positions[:self.setup_counts[0]],self.positions[self.setup_counts[0]:]),public_only=True)
+        if extra is None:return
         self.invalidate_placement()
         self.clear_error()
         self.placement_thinking = True
@@ -1196,7 +1474,7 @@ class MainWindow(QMainWindow):
         self.analysis.placement_text.setText("Recherche en cours ; les coordonnées restent saisissables.")
         self.analysis.tabs.setCurrentIndex(2)
         self.launch("placement", (powers, self.first.currentIndex(), budget, opponent,
-                                  self.placement_started + budget), self.placement_generation,
+                                  self.placement_started + budget,extra), self.placement_generation,
                     self.placement_ready, self.placement_progress, self.placement_error)
 
     def placement_progress(self, advice: PlacementAdvice, token):
@@ -1204,7 +1482,7 @@ class MainWindow(QMainWindow):
             return
         self.placement_advice = advice
         cells = advice.robot_cells
-        pair = f"Robot 1 : {coord(cells[0])} · Robot 2 : {coord(cells[1])}"
+        pair="Placement secret du robot" if self.robot.currentData()==39 else " · ".join(f"Robot {i+1} : {coord(c)}" for i,c in enumerate(cells))
         order = "Le robot répond à votre placement." if advice.first_to_place == 0 else (
             "Le robot se place en premier ; votre placement futur n'est pas utilisé.")
         score = "…" if advice.score is None else f"{advice.score:+.1f}"
@@ -1214,7 +1492,7 @@ class MainWindow(QMainWindow):
         opponent = advice.opponent_cells or (-1, -1)
         preview = Position(workers=(opponent, cells), powers=(self.mine.currentData(), self.robot.currentData()),
                            player=self.first.currentIndex())
-        self.analysis.placement_board.render_position(preview, cells)
+        self.analysis.placement_board.render_position(self.visible_position(preview), () if self.robot.currentData()==39 else cells)
 
     def placement_ready(self, advice, token):
         if token != self.placement_generation or self.session is not None or self.closing:
@@ -1238,9 +1516,10 @@ class MainWindow(QMainWindow):
         if self.session is not None or self.placement_thinking or self.placement_advice is None or not self.robot_mode():
             return
         # Only the robot's fields change. Human pieces remain theirs to place.
-        self.positions[2:] = self.placement_advice.robot_cells
+        split=self.setup_counts[0]
+        self.positions[split:] = self.placement_advice.robot_cells
         self.clear_error()
-        conflicts = [i for i in (0, 1) if self.positions[i] in self.positions[2:]]
+        conflicts = [i for i in range(split) if self.positions[i] in self.positions[split:]]
         if conflicts:
             self.fail("Le robot se place en premier : modifiez vos pions qui occupent une case maintenant choisie par le robot.")
             self.slot.setCurrentIndex(conflicts[0])
@@ -1257,7 +1536,7 @@ class MainWindow(QMainWindow):
         if self.placement_thinking:
             elapsed = time.monotonic() - self.placement_started
             cells = (f" · proposition {coord(self.placement_advice.robot_cells[0])}, {coord(self.placement_advice.robot_cells[1])}"
-                     if self.placement_advice else "")
+                     if self.placement_advice and self.robot.currentData()!=39 else "")
             self.placement_status.setText(f"Placement : {min(elapsed, self.placement_budget.value()):.1f} / "
                                           f"{self.placement_budget.value():g} s{cells}")
 

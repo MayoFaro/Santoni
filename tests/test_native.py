@@ -69,10 +69,10 @@ def test_native_immediate_win_and_forced_defence():
     assert result.turn.after.domes & (1 << 12)
 
 
-def test_advanced_and_hero_positions_use_reference_engine():
-    assert not eligible(Position(powers=(0, 46)))
-    assert not eligible(Position(powers=(19, 0)))
-    assert not eligible(Position(adonis=(0, 1, 1)))
+def test_advanced_and_hero_positions_are_native_eligible():
+    assert eligible(Position(powers=(0, 46)))
+    assert eligible(Position(powers=(19, 0)))
+    assert eligible(Position(adonis=(0, 1, 1)))
 
 
 def test_search_reports_active_depth_and_deadline():

@@ -1,7 +1,8 @@
 """Pure, immutable game rules. A Turn always includes all of its actions.
 
 UI and search use the same legal-turn generator. No Qt imports or disk access.
-The engine implements the public powers marked supported in powers.py.
+The original 38 powers retain a Python test oracle. The remaining cards and
+advanced state use the Rust engine; search never calls Python per node.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator
 
 from .powers import POWERS
+from .extra import Extra, requires_native, initial_count
 
 
 def coord(cell: int) -> str:
@@ -63,8 +65,24 @@ class Action:
             return f"Forcer {piece} : {coord(self.source)} → {coord(self.target)}"
         if self.kind == "place":
             return f"Placer {piece} en {coord(self.target)}"
+        if self.kind == "adonis" and self.source<0:return f"Adonis : désigner {piece} (position secrète)"
         if self.kind == "adonis":
             return f"Adonis : désigner {piece} en {coord(self.target)}"
+        if self.kind=="swap_hidden":return f"Échanger {piece} avec le bâtisseur secret adverse {self.target+1}"
+        if self.kind=="probe_kill":return f"Theseus : tenter une élimination en {coord(self.target)}"
+        if self.kind=="probe_remove":return f"Medea : tenter de retirer un bloc en {coord(self.target)}"
+        if self.kind=="probe_force":return f"Odysseus : forcer {piece} caché vers {coord(self.target)}"
+        if self.kind=="probe_charon":return f"Charon : tenter de forcer le bâtisseur caché de l’autre côté de {coord(self.source)} vers {coord(self.target)}"
+        if self.kind=="hidden_move":return f"{piece} caché : direction {coord(self.target)} depuis C3"
+        if self.kind=="hidden_build":return f"Construire en {coord(self.target)} avec {piece} caché"
+        if self.kind=="sing":return f"Siren : forcer {piece} dans la direction du chant (position secrète)"
+        if self.kind=="draw":return f"Chaos : carte {POWERS[self.target].name}"
+        if self.kind=="decline":return "Renoncer à l’intervention"
+        if self.kind=="extra_turn":return "Jouer le tour supplémentaire de Dionysus"
+        if self.kind=="wind":return f"Vent : direction {coord(self.target)} depuis C3"
+        if self.kind=="whirlpool":return f"Tourbillon en {coord(self.target)}"
+        if self.kind=="talus":return f"Talus en {coord(self.target)}"
+        if self.kind=="swap":return f"Échanger {piece} ({coord(self.source)}) avec l’adversaire en {coord(self.target)}"
         return self.kind
 
 
@@ -80,6 +98,8 @@ class Position:
     adonis: tuple[int, int, int] | None = None
     winner: int | None = None
     reason: str = ""
+    extra: Extra = Extra()
+    resume: str = ""
 
     def occupied(self, cell):
         return bool(self.domes & (1 << cell)) or any(cell in ws for ws in self.workers)
@@ -89,7 +109,9 @@ class Position:
                 "workers": [list(ws) for ws in self.workers], "powers": list(self.powers),
                 "player": self.player, "hero_used": list(self.hero_used),
                 "athena_lock": self.athena_lock, "adonis": self.adonis,
-                "winner": self.winner, "reason": self.reason}
+                "winner": self.winner, "reason": self.reason,
+                **({"extra":self.extra.to_dict()} if self.extra!=Extra() else {}),
+                **({"resume":__import__("json").loads(self.resume)} if self.resume else {})}
 
     @classmethod
     def from_dict(cls, data):
@@ -99,11 +121,22 @@ class Position:
                   hero_used=tuple(data.get("hero_used", (False, False))),
                   athena_lock=data.get("athena_lock", False),
                   adonis=tuple(data["adonis"]) if data.get("adonis") else None,
-                  winner=data.get("winner"), reason=data.get("reason", ""))
+                  winner=data.get("winner"), reason=data.get("reason", ""),
+                  extra=Extra.from_dict(data.get("extra",{})),
+                  resume=__import__("json").dumps(data["resume"],sort_keys=True,separators=(",",":")) if data.get("resume") else "")
         pos.validate()
         return pos
 
     def validate(self):
+        self.extra.validate()
+        if self.resume:
+            import json
+            data=json.loads(self.resume)
+            if data.get("origin",{}).get("resume") or not 0<len(data.get("actions",[]))<=128:
+                raise ValueError("Contexte de reprise invalide.")
+            Position.from_dict(data["origin"])
+            if any(len(a)!=5 or not 0<=a[0]<=23 or a[1] not in (0,1) or not -1<=a[2]<=3 or not -1<=a[3]<=24 or not -1<=a[4]<=24 for a in data["actions"]):
+                raise ValueError("Actions de reprise invalides.")
         if len(self.heights) != 25 or any(type(h) is not int or not 0 <= h <= 3 for h in self.heights):
             raise ValueError("Les hauteurs doivent être comprises entre 0 et 3.")
         if type(self.domes) is not int or not 0 <= self.domes < 1 << 25:
@@ -112,7 +145,7 @@ class Position:
             raise ValueError("Joueur invalide.")
         if len(self.powers) != 2 or any(p not in POWERS or not POWERS[p].supported for p in self.powers):
             raise ValueError("Pouvoir non pris en charge.")
-        if len(self.workers) != 2 or any(not 2 <= len(w) <= 3 for w in self.workers):
+        if len(self.workers) != 2 or any(not 2 <= len(w) <= 4 for w in self.workers):
             raise ValueError("Nombre de bâtisseurs invalide.")
         present = [w for ws in self.workers for w in ws if w != -1]
         if any(type(w) is not int or not 0 <= w < 25 or self.domes & (1 << w) for w in present):
@@ -133,7 +166,9 @@ class Turn:
     after: Position
 
     def label(self):
-        return " ; ".join(a.label() for a in self.actions)
+        text=" ; ".join(a.label() for a in self.actions) or "Terminer le tour interrompu"
+        if self.after.extra.event==2:text+=" — intervention immédiate de Gaea"
+        return text
 
     def description(self, before):
         lines = [self.label()]
@@ -149,6 +184,7 @@ class Turn:
         return "\n".join(lines)
 
     def power_summary(self, before):
+        if not self.actions:return "Tour interrompu terminé"
         power = before.powers[before.player]
         if power == 0:
             return "Aucun pouvoir"
@@ -314,6 +350,12 @@ def _raw_turns(position: Position, prefix: tuple[Action, ...] = (),
     is called throughout generation, allowing cancellation and hard deadlines.
     """
     if position.winner is not None:
+        return
+    if requires_native(position):
+        from .native import native_iter_turns
+        for turn in native_iter_turns(position,prefix,check):
+            check()
+            if turn.actions[:len(prefix)]==tuple(prefix):yield turn
         return
     p, foe = position.player, 1 - position.player
     power = position.powers[p]
@@ -649,6 +691,12 @@ def legal_turns(position: Position, prefix: tuple[Action, ...] = (),
     """
     if position.winner is not None:
         return
+    if requires_native(position):
+        from .native import native_iter_turns
+        for turn in native_iter_turns(position,prefix,check):
+            check()
+            if turn.actions[:len(prefix)]==tuple(prefix):yield turn
+        return
     p, foe = position.player, 1 - position.player
     power = position.powers[p]
     need_up = position.powers[foe] == 26 and (any(position.heights) or power == 46)
@@ -699,6 +747,9 @@ def _ascended(position, actions):
 
 def next_actions(position, prefix=(), check=lambda: None):
     """Find each possible next action once, pruning its remaining subtree."""
+    if requires_native(position):
+        from .native import native_next_actions
+        return native_next_actions(position,prefix)
     options = set()
     complete = None
     for turn in legal_turns(position, tuple(prefix), check, options):
@@ -711,7 +762,11 @@ def next_actions(position, prefix=(), check=lambda: None):
 
 def validate_turn(position, actions):
     actions = tuple(actions)
-    turn = next((t for t in legal_turns(position, actions) if t.actions == actions), None)
+    if requires_native(position):
+        from .native import native_next_actions
+        _,turn=native_next_actions(position,actions)
+    else:
+        turn = next((t for t in legal_turns(position, actions) if t.actions == actions), None)
     if turn is None:
         raise ValueError("Ce tour ne respecte pas les règles ou n'est pas complet.")
     return turn
@@ -723,16 +778,22 @@ def terminal_position(position, check=lambda: None):
     checked = _chronus(position)
     if checked.winner is not None:
         return checked
-    if next(legal_turns(position, check=check), None) is None:
+    if requires_native(position):
+        choices,complete=next_actions(position,check=check)
+        empty=not choices and complete is None
+    else:empty=next(legal_turns(position,check=check),None) is None
+    if empty:
         return replace(position, winner=1 - position.player, reason="Aucun tour complet légal")
     return position
 
 
-def validate_setup(workers, powers, player):
-    pos = Position(workers=tuple(tuple(ws) for ws in workers), powers=tuple(powers), player=player)
+def validate_setup(workers, powers, player, extra=None):
+    pos = Position(workers=tuple(tuple(ws) for ws in workers), powers=tuple(powers), player=player, extra=extra or Extra())
     pos.validate()
-    if any(len(ws) != 2 for ws in workers) or any(w < 0 for ws in workers for w in ws):
-        raise ValueError("Placez les quatre bâtisseurs initiaux.")
+    if any(len(ws) != initial_count(powers[p]) for p,ws in enumerate(workers)) or any(w < 0 for ws in workers for w in ws):
+        raise ValueError("Placez tous les bâtisseurs initiaux de chaque pouvoir.")
+    from .setup import configure_extra
+    pos=replace(pos,extra=configure_extra(pos,extra))
     if powers[0] and powers[0] == powers[1]:
         raise ValueError("Les joueurs doivent choisir des pouvoirs différents.")
     for p in (0, 1):
@@ -742,3 +803,25 @@ def validate_setup(workers, powers, player):
             if not opposite:
                 raise ValueError("Eros doit placer ses bâtisseurs sur deux bords opposés.")
     return pos
+
+
+def preview_position(position, actions):
+    if requires_native(position):
+        from .native import native_preview
+        return native_preview(position,actions)
+    for action in actions:position=_apply(position,action)
+    return position
+
+
+def resolve_plan(position, actions):
+    """Resolve a suggested public plan against the referee's actual state.
+
+    Hidden collisions and immediate victories can terminate the planned turn
+    before its construction. Only the actions actually attempted are archived.
+    """
+    actions=tuple(actions)
+    for length in range(1,len(actions)+1):
+        _,complete=next_actions(position,actions[:length])
+        if complete and (complete.after.winner is not None or complete.after.reason=="Action annulée par Hecate" or complete.after.extra.event==2):
+            return complete
+    return validate_turn(position,actions)

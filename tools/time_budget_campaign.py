@@ -20,8 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'experiments/references/initial-cb732bb'
 SOURCE = REFERENCE / 'source'
 # Both native search and independent Python validation use the frozen snapshot.
-sys.path.insert(0, str(SOURCE))
-os.environ['SANTONI_ENGINE_LIB'] = str(REFERENCE / 'libsantoni_engine.so')
+if __name__ in ("__main__", "__mp_main__"):
+    # Only campaign subprocesses may select the frozen engine. Importing the
+    # reporting helpers must not redirect the application's native library.
+    sys.path.insert(0, str(SOURCE))
+    os.environ['SANTONI_ENGINE_LIB'] = str(REFERENCE / 'libsantoni_engine.so')
 from santorini.engine import Position, validate_setup, validate_turn
 from santorini.native import native_search
 from santorini.powers import POWERS

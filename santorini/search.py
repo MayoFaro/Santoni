@@ -259,14 +259,22 @@ def choose_power(available, opponent: int | None, player: int, seconds: float,
                 # for all supported initial powers, including both sides Eros.
                 if 19 in pair:
                     workers = ((5, 9), (15, 19))
-                pos = validate_setup(workers, pair, first)
+                from .setup import reference_setup
+                pos = reference_setup(workers,pair,first)
                 budget = min(per_probe, deadline - time.monotonic())
                 if budget < 0.001:
                     advice.elapsed = time.monotonic() - start
                     advice.status = "Budget terminé ; seules les comparaisons complètes sont retenues"
                     return advice
-                from .native import eligible, library_path, native_search
-                if eligible(pos) and library_path().exists() and budget >= 0.01:
+                from .native import eligible, library_path, native_search, native_expectation
+                if 14 in pair and library_path().exists():
+                    owner=pair.index(14)
+                    cards=list(pos.extra.chaos);cards[owner]=0
+                    deck=list(pos.extra.deck);deck[owner]|=pos.extra.discard[owner]
+                    discard=list(pos.extra.discard);discard[owner]=0
+                    random_pos=replace(pos,extra=replace(pos.extra,chaos=tuple(cards),deck=tuple(deck),discard=tuple(discard),event=1,event_owner=owner,return_player=first))
+                    analysis=native_expectation(random_pos,budget,cancelled=cancelled)
+                elif eligible(pos) and library_path().exists():
                     analysis = native_search(pos, budget, cancelled=cancelled)
                 else:
                     analysis = search(pos, budget, cancelled=cancelled)

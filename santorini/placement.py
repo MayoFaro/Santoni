@@ -11,26 +11,32 @@ import time
 from dataclasses import dataclass
 
 from .engine import Position, validate_setup
+from .extra import initial_count
+from .setup import reference_setup
 from .search import Interrupted, evaluate, search
 
 
 def placement_first(powers, first_player):
     """Bia overrides placement order, not who takes the first game turn."""
-    return powers.index(13) if 13 in powers else first_player
+    for power in (13,43):
+        if power in powers:return powers.index(power)
+    if 39 in powers:return 1-powers.index(39)
+    return first_player
 
 
 def legal_pairs(power, excluded=()):
     cells = [c for c in range(25) if c not in excluded]
     # Selene's female worker has a distinct identity. Do not collapse the
     # assignments (a,b) and (b,a) for this power.
-    pairs = itertools.permutations(cells, 2) if power == 28 else itertools.combinations(cells, 2)
-    for a, b in pairs:
+    pairs = itertools.permutations(cells, 2) if power == 28 else itertools.combinations(cells, initial_count(power))
+    for group in pairs:
         if power == 19:
+            a,b=group
             opposite = (a % 5 == 0 and b % 5 == 4) or (b % 5 == 0 and a % 5 == 4) or (
                 a // 5 == 0 and b // 5 == 4) or (b // 5 == 0 and a // 5 == 4)
             if not opposite:
                 continue
-        yield a, b
+        yield group
 
 
 @dataclass(frozen=True)
@@ -63,8 +69,8 @@ def _priority(pair, power, opponent=()):
     return value
 
 
-def _opening(powers, first, robot, opponent):
-    return Position(workers=(opponent, robot), powers=powers, player=first)
+def _opening(powers, first, robot, opponent, extra=None):
+    return reference_setup((opponent,robot),powers,first,extra)
 
 
 def _probe(position, seconds, cancelled):
@@ -79,7 +85,7 @@ def _probe(position, seconds, cancelled):
 
 
 def choose_placement(powers, first_player, seconds, opponent_cells=None,
-                     cancelled=lambda: False, publish=lambda advice: None):
+                     cancelled=lambda: False, publish=lambda advice: None, extra=None):
     start = time.monotonic()
     if not .1 <= seconds <= 600:
         raise ValueError("Le budget du placement doit être compris entre 0,1 et 600 secondes.")
@@ -90,10 +96,10 @@ def choose_placement(powers, first_player, seconds, opponent_cells=None,
     first = placement_first(powers, first_player)
     deadline = start + seconds
     if first == 0:
-        if opponent_cells is None or len(opponent_cells) != 2:
+        if opponent_cells is None or len(opponent_cells) != initial_count(powers[0]):
             raise ValueError("Placez d'abord vos deux bâtisseurs : le robot se place après vous.")
         opponent_cells = tuple(opponent_cells)
-        if len(set(opponent_cells)) != 2 or any(type(c) is not int or not 0 <= c < 25 for c in opponent_cells):
+        if len(set(opponent_cells)) != initial_count(powers[0]) or any(type(c) is not int or not 0 <= c < 25 for c in opponent_cells):
             raise ValueError("Vos deux bâtisseurs doivent occuper deux cases distinctes du plateau.")
         if opponent_cells not in set(legal_pairs(powers[0])) and tuple(reversed(opponent_cells)) not in set(legal_pairs(powers[0])):
             raise ValueError("Votre placement ne respecte pas les contraintes de votre pouvoir (Eros).")
@@ -107,7 +113,7 @@ def choose_placement(powers, first_player, seconds, opponent_cells=None,
         raise ValueError("Aucun placement légal disponible pour le robot.")
     fallback = candidates[0]
     if opponent_cells:
-        validate_setup((opponent_cells, fallback), powers, first_player)
+        _opening(powers,first_player,fallback,opponent_cells,extra).validate()
     best = PlacementAdvice(fallback, opponent_cells, first, None, 0, 0, 0,
                            "Premier placement légal ; comparaison en cours")
     publish(best)
@@ -133,7 +139,7 @@ def choose_placement(powers, first_player, seconds, opponent_cells=None,
             exact = True
             for reply in replies:
                 check(screen_end)
-                value = float(evaluate(_opening(powers, first_player, pair, reply), 1))
+                value = float(evaluate(_opening(powers, first_player, pair, reply,extra), 1))
                 total_replies += 1
                 if value < worst:
                     worst, worst_reply = value, reply
@@ -169,7 +175,7 @@ def choose_placement(powers, first_player, seconds, opponent_cells=None,
             # Sample the most challenging geometric replies and Bia attack
             # replies. Game search determines their score with both powers.
             replies = list(legal_pairs(powers[0], pair))
-            replies.sort(key=lambda reply: (evaluate(_opening(powers, first_player, pair, reply), 1),
+            replies.sort(key=lambda reply: (evaluate(_opening(powers, first_player, pair, reply,extra), 1),
                                             -_priority(reply, powers[0], pair), reply))
             replies = replies[:12]
         probes.append((pair, replies))
@@ -191,7 +197,7 @@ def choose_placement(powers, first_player, seconds, opponent_cells=None,
                 budget = min(per_probe, deadline - time.monotonic())
                 if budget < .001:
                     raise Interrupted
-                value = _probe(_opening(powers, first_player, pair, reply), budget, cancelled)
+                value = _probe(_opening(powers, first_player, pair, reply,extra), budget, cancelled)
                 total_replies += 1
                 if value is None:
                     informed = False
