@@ -153,3 +153,27 @@ réduction des copies restantes (reconstruction de la ligne principale sans
 `Vec<Turn>` dupliqué à chaque nœud terminal) et le profilage détaillé
 (génération / dédoublonnage / tri / évaluation / cache), qui n'ont toujours
 pas été mesurés séparément.
+
+## Reproduction
+
+`tools/version_bench.py` est repris sans modification du worktree
+`decision-quality` (outil générique à deux binaires, indépendant de toute
+piste stratégique). Depuis ce worktree, avec un nouveau dossier de sortie :
+
+```sh
+cargo test --manifest-path native_engine/Cargo.toml
+cargo build --release --manifest-path native_engine/Cargo.toml
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q
+python3 tools/version_bench.py positions \
+  --baseline experiments/references/main-7ebcc8a/libsantoni_engine.so \
+  --candidate experiments/tt-memory-5s-20261009/variant/libsantoni_engine.so \
+  --positions experiments/tt-memory-5s-20261009/positions.json \
+  --output experiments/tt-memory-5s-<nouvelle-date>/positions-check \
+  --seconds 5 --workers 6
+python3 tools/version_bench.py matches \
+  --baseline experiments/references/main-7ebcc8a/libsantoni_engine.so \
+  --candidate experiments/tt-memory-5s-20261009/variant/libsantoni_engine.so \
+  --output experiments/tt-memory-5s-<nouvelle-date>/matches \
+  --seconds 5 --workers 10 --seed <nouvelle-graine> \
+  --matchups 0:0,7:6,1:8,2:3,4:9,5:10,1:3,2:9,4:5,8:10  # répéter chaque paire 10 fois pour 100 configurations
+```
