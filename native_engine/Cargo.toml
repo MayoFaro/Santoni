@@ -10,3 +10,9 @@ crate-type = ["cdylib", "rlib"]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[features]
+# Zero-cost by default. Enables timers around the remaining per-node PV
+# clone in Search::minimax, read with `cargo test --features profile --
+# --nocapture --test-threads 1`. Never built into the shipped library.
+profile = []

@@ -617,6 +617,7 @@ pub(super) fn hidden_search(s: &State, seconds: f64, cancelled: &dyn Fn() -> boo
         nodes: 0,
         root: p,
         table: HashMap::new(),
+        clone_ns: 0,
     };
     let mut best: Option<Turn> = None;
     let mut best_value = -2 * MATE;
