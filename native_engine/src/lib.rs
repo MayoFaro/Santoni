@@ -501,6 +501,36 @@ struct Search<'a> {
     clone_ns: u64,
 }
 
+/// Canonical form of `s` used only as a deduplication / hashing key, never
+/// as a `State` that circulates through search or gets returned to a
+/// caller. For base powers (power <= 10, two workers each, no hero/variant
+/// state) the two workers belonging to the same player are strategically
+/// interchangeable: `evaluate` sums over a player's workers regardless of
+/// slot order, and `can_step`/`builds`/`apply` only ever look up a worker
+/// by its cell (via `.contains`/`.position`), never by assuming worker-slot
+/// 0 or 1 plays a distinguished role. Swapping a player's own pair of
+/// worker slots therefore never changes legality, evaluation, or any
+/// reachable future play, so two positions differing only by that swap are
+/// the same position for search purposes and must not be explored as two
+/// separate siblings (see profilage-hermes-20261009.md: for Hermès this
+/// alone collapses the branching factor by half).
+fn canonical_key(s: &State) -> State {
+    let mut k = *s;
+    if k.powers.iter().all(|&p| p <= 10)
+        && k.counts == [2, 2]
+        && k.adonis == [-1; 3]
+        && k.extra == special::Extra::default()
+        && k.resume.length == 0
+    {
+        for p in 0..2 {
+            if k.workers[p][0] > k.workers[p][1] {
+                k.workers[p].swap(0, 1);
+            }
+        }
+    }
+    k
+}
+
 fn ordered_visit(
     s: &State,
     preferred: Option<&Turn>,
@@ -510,7 +540,7 @@ fn ordered_visit(
 ) -> GResult {
     let mut seen = HashSet::new();
     if let Some(turn) = preferred {
-        seen.insert(turn.after);
+        seen.insert(canonical_key(&turn.after));
         visitor(turn.clone())?;
     }
     let mut batch: Vec<Turn> = Vec::with_capacity(24);
@@ -522,7 +552,7 @@ fn ordered_visit(
         Ok(())
     };
     let mut accumulate = |turn: Turn, batch: &mut Vec<Turn>| -> GResult {
-        if seen.insert(turn.after) {
+        if seen.insert(canonical_key(&turn.after)) {
             batch.push(turn);
         }
         if batch.len() >= 24 {
@@ -1083,11 +1113,24 @@ mod tests {
         let mut seen = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         ordered_visit(&state, None, deadline, &|| false, &mut |t| {
+            // Nothing fabricated: every visited turn must be a genuine
+            // member of the raw, non-canonicalised generation.
+            assert!(all.contains(&t.after));
             seen.insert(t.after);
             Ok(())
         })
         .unwrap();
-        assert_eq!(all, seen);
+        // `ordered_visit` canonicalises its dedup key (see
+        // `canonical_key`): two raw states that differ only by swapping a
+        // player's own pair of workers are the same strategic position and
+        // now collapse to a single visited sibling. The regression guard
+        // this test protects is therefore no longer "the exact same raw
+        // set" but "no canonical class lost, and exactly one
+        // representative visited per class".
+        let canon_all: HashSet<State> = all.iter().map(canonical_key).collect();
+        let canon_seen: HashSet<State> = seen.iter().map(canonical_key).collect();
+        assert_eq!(canon_all, canon_seen);
+        assert_eq!(seen.len(), canon_all.len());
     }
     #[test]
     fn ordered_visit_still_visits_preferred_hermes_move_first() {
@@ -1102,6 +1145,174 @@ mod tests {
         })
         .unwrap();
         assert_eq!(order[0], preferred.after);
+    }
+    // --- Task 2: canonical equivalence of a player's own two workers ---
+    #[test]
+    fn hermes_worker_swap_states_are_distinct_raw_entries() {
+        // Proves the problem, independently of `canonical_key`: in the raw,
+        // un-canonicalised generation, every successor that moves both of
+        // Hermès's workers has a worker-swapped twin that is *also*
+        // present, and `State`'s derived `Eq`/`Hash` treats the two as
+        // unrelated entries.
+        let state = hermes_initial();
+        let turns = generate(&state, None, &|| false, usize::MAX).unwrap();
+        let raw: HashSet<State> = turns.iter().map(|t| t.after).collect();
+        assert!(
+            raw.len() > 1000,
+            "attendu un grand espace Hermès, obtenu {}",
+            raw.len()
+        );
+        let mut swap_duplicates = 0;
+        for &a in &raw {
+            let mut swapped = a;
+            swapped.workers[0].swap(0, 1);
+            if swapped != a && raw.contains(&swapped) {
+                swap_duplicates += 1;
+            }
+        }
+        assert_eq!(
+            swap_duplicates,
+            raw.len(),
+            "chaque état devrait avoir un jumeau échangé, lui aussi présent"
+        );
+    }
+    #[test]
+    fn canonical_key_is_invariant_under_swapping_a_players_own_workers() {
+        let mut a = initial();
+        a.workers[0] = [6, 8, -1, -1];
+        let mut b = a;
+        b.workers[0] = [8, 6, -1, -1];
+        assert_ne!(a, b, "derived Eq still sees two distinct raw states");
+        assert_eq!(canonical_key(&a), canonical_key(&b));
+    }
+    #[test]
+    fn canonical_key_halves_the_hermes_raw_successor_set() {
+        let state = hermes_initial();
+        let turns = generate(&state, None, &|| false, usize::MAX).unwrap();
+        let raw: HashSet<State> = turns.iter().map(|t| t.after).collect();
+        let canon: HashSet<State> = raw.iter().map(canonical_key).collect();
+        assert_eq!(canon.len(), raw.len() / 2);
+    }
+    #[test]
+    fn ordered_visit_halves_hermes_branching_via_worker_swap_canonicalisation() {
+        let state = hermes_initial();
+        let raw_count = generate(&state, None, &|| false, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.after)
+            .collect::<HashSet<_>>()
+            .len();
+        let mut visited = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        ordered_visit(&state, None, deadline, &|| false, &mut |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, raw_count / 2);
+    }
+    /// Full, unordered, non-canonicalised minimax used only as a ground
+    /// truth oracle in tests: mirrors `Search::minimax`'s leaf and
+    /// stuck-player handling exactly, but recurses over every raw,
+    /// dedup-by-exact-state successor with no alpha-beta pruning, no
+    /// transposition table, and no worker-swap canonicalisation.
+    fn plain_minimax(s: &State, depth: u32, root: usize, ply: u32) -> i32 {
+        if s.winner >= 0 {
+            return if s.winner as usize == root {
+                MATE - ply as i32
+            } else {
+                -MATE + ply as i32
+            };
+        }
+        if depth == 0 {
+            let legal = generate(s, None, &|| false, 1).unwrap();
+            return if legal.is_empty() {
+                if s.player as usize == root {
+                    -MATE + ply as i32
+                } else {
+                    MATE - ply as i32
+                }
+            } else {
+                evaluate(s, root)
+            };
+        }
+        let mut seen = HashSet::new();
+        let turns: Vec<Turn> = generate(s, None, &|| false, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|t| seen.insert(t.after))
+            .collect();
+        if turns.is_empty() {
+            return if s.player as usize == root {
+                -MATE + ply as i32
+            } else {
+                MATE - ply as i32
+            };
+        }
+        let maximizing = s.player as usize == root;
+        let mut value = if maximizing { -2 * MATE } else { 2 * MATE };
+        for t in &turns {
+            let v = plain_minimax(&t.after, depth - 1, root, ply + 1);
+            if (maximizing && v > value) || (!maximizing && v < value) {
+                value = v;
+            }
+        }
+        value
+    }
+    #[test]
+    fn worker_swap_does_not_change_plain_minimax_value() {
+        // Direct, implementation-independent check of the mathematical
+        // claim behind `canonical_key`: swapping a player's own pair of
+        // workers never changes the fully-searched minimax value, at any
+        // depth, because nothing in generation/evaluation distinguishes
+        // worker-slot 0 from worker-slot 1 for that player.
+        let mut s = hermes_initial();
+        s.heights[7] = 1;
+        let mut swapped = s;
+        swapped.workers[0].swap(0, 1);
+        assert_ne!(s, swapped);
+        let root = s.player as usize;
+        for depth in 0..=2 {
+            assert_eq!(
+                plain_minimax(&s, depth, root, 0),
+                plain_minimax(&swapped, depth, root, 0),
+                "mismatch at depth {depth}"
+            );
+        }
+    }
+    #[test]
+    fn canonicalisation_preserves_minimax_value_on_sample_hermes_positions() {
+        // Compares the real search path (`Search::minimax`, which now uses
+        // `ordered_visit`'s canonicalised dedup) against `plain_minimax`
+        // (full, non-canonicalised reference) on a handful of constructed
+        // positions. Scores must match exactly: dropping a worker-swap
+        // duplicate must never change the minimax value.
+        let mut varied_heights = hermes_initial();
+        varied_heights.heights[7] = 1;
+        varied_heights.heights[12] = 2;
+        let mut with_a_dome = hermes_initial();
+        with_a_dome.domes |= 1 << 19;
+        with_a_dome.heights[19] = 3;
+        let samples = [hermes_initial(), varied_heights, with_a_dome];
+        for state in samples {
+            let root = state.player as usize;
+            let reference = plain_minimax(&state, 2, root, 0);
+            let mut search = dummy_search();
+            search.root = root;
+            search.deadline = Instant::now() + Duration::from_secs(30);
+            let (value, line) = search.minimax(&state, 2, -2 * MATE, 2 * MATE, 0).unwrap();
+            assert_eq!(value, reference, "score mismatch for a sample position");
+            if let Some(first) = line.first() {
+                // Légalité : le tour restitué est un vrai tour légal, pas
+                // un état fabriqué par la canonisation.
+                let legal: HashSet<State> = generate(&state, None, &|| false, usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.after)
+                    .collect();
+                assert!(legal.contains(&first.after));
+            }
+        }
     }
     fn dummy_search() -> Search<'static> {
         Search {
