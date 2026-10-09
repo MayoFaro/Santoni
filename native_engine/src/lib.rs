@@ -1,6 +1,7 @@
 //! Native rules and search for the 55 supplied gods and heroes.
 //! No external crates. Complete turns, interrupt ownership and chance nodes.
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 mod advanced;
 mod special;
@@ -451,12 +452,14 @@ fn evaluate(s: &State, player: usize) -> i32 {
     strength(player) - strength(1 - player)
 }
 
+const TABLE_CAP: usize = 50_000;
+
 #[derive(Clone)]
 struct Entry {
     depth: u32,
     value: i32,
     flag: u8,
-    line: Vec<Turn>,
+    line: Rc<Vec<Turn>>,
 }
 
 struct Search<'a> {
@@ -530,6 +533,30 @@ impl Search<'_> {
             Ok(())
         }
     }
+    /// Insert or refresh a transposition entry. A key already present is
+    /// always updated, even once the table reached `TABLE_CAP`, since this
+    /// never grows its size. A brand-new key past the cap only displaces an
+    /// arbitrary existing entry that is no deeper than the incoming one:
+    /// this keeps the bounded memory cost while favouring the deepest
+    /// knowledge over shallow entries, instead of refusing every insertion
+    /// once the table first fills up.
+    fn store(&mut self, key: (State, u32), entry: Entry) {
+        if self.table.len() < TABLE_CAP || self.table.contains_key(&key) {
+            self.table.insert(key, entry);
+            return;
+        }
+        let victim = self
+            .table
+            .iter()
+            .next()
+            .map(|(&k, v)| (k, v.depth))
+            .filter(|&(_, depth)| depth <= entry.depth)
+            .map(|(k, _)| k);
+        if let Some(victim) = victim {
+            self.table.remove(&victim);
+            self.table.insert(key, entry);
+        }
+    }
     fn minimax(
         &mut self,
         s: &State,
@@ -577,7 +604,7 @@ impl Search<'_> {
         if let Some(entry) = &cached {
             if entry.depth >= depth {
                 if entry.flag == 0 {
-                    return Ok((entry.value, entry.line.clone()));
+                    return Ok((entry.value, (*entry.line).clone()));
                 }
                 if entry.flag == 1 {
                     alpha = alpha.max(entry.value);
@@ -585,7 +612,7 @@ impl Search<'_> {
                     beta = beta.min(entry.value);
                 }
                 if alpha >= beta {
-                    return Ok((entry.value, entry.line.clone()));
+                    return Ok((entry.value, (*entry.line).clone()));
                 }
             }
         }
@@ -648,17 +675,15 @@ impl Search<'_> {
         } else {
             0
         };
-        if self.table.len() < 50_000 {
-            self.table.insert(
-                key,
-                Entry {
-                    depth,
-                    value,
-                    flag,
-                    line: line.clone(),
-                },
-            );
-        }
+        self.store(
+            key,
+            Entry {
+                depth,
+                value,
+                flag,
+                line: Rc::new(line.clone()),
+            },
+        );
         Ok((value, line))
     }
     fn output(
@@ -989,6 +1014,79 @@ mod tests {
             .iter()
             .any(|t| t.actions.iter().any(|a| a.kind == 0 && a.worker == 0)
                 && t.actions.iter().any(|a| a.kind == 0 && a.worker == 1)));
+    }
+    fn dummy_search() -> Search<'static> {
+        Search {
+            started: Instant::now(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancelled: &|| false,
+            nodes: 0,
+            root: 0,
+            table: HashMap::new(),
+        }
+    }
+    fn dummy_key(tag: u32) -> (State, u32) {
+        let mut s = initial();
+        s.domes = tag;
+        (s, 0)
+    }
+    fn dummy_entry(depth: u32) -> Entry {
+        Entry {
+            depth,
+            value: 0,
+            flag: 0,
+            line: Rc::new(vec![]),
+        }
+    }
+    #[test]
+    fn store_grows_table_below_capacity() {
+        let mut search = dummy_search();
+        search.store(dummy_key(0), dummy_entry(3));
+        assert_eq!(search.table.len(), 1);
+        assert_eq!(search.table[&dummy_key(0)].depth, 3);
+    }
+    #[test]
+    fn store_updates_existing_key_even_when_table_full() {
+        let mut search = dummy_search();
+        for i in 0..TABLE_CAP as u32 {
+            search.store(dummy_key(i), dummy_entry(5));
+        }
+        assert_eq!(search.table.len(), TABLE_CAP);
+        search.store(dummy_key(0), dummy_entry(9));
+        assert_eq!(search.table.len(), TABLE_CAP);
+        assert_eq!(search.table[&dummy_key(0)].depth, 9);
+    }
+    #[test]
+    fn store_replaces_shallow_victim_with_deeper_new_entry() {
+        let mut search = dummy_search();
+        for i in 0..TABLE_CAP as u32 {
+            search.store(dummy_key(i), dummy_entry(1));
+        }
+        assert_eq!(search.table.len(), TABLE_CAP);
+        let new_key = dummy_key(TABLE_CAP as u32);
+        search.store(new_key, dummy_entry(5));
+        assert_eq!(search.table.len(), TABLE_CAP);
+        assert_eq!(search.table[&new_key].depth, 5);
+    }
+    #[test]
+    fn store_keeps_deep_entries_over_a_shallow_newcomer() {
+        let mut search = dummy_search();
+        for i in 0..TABLE_CAP as u32 {
+            search.store(dummy_key(i), dummy_entry(9));
+        }
+        assert_eq!(search.table.len(), TABLE_CAP);
+        let new_key = dummy_key(TABLE_CAP as u32);
+        search.store(new_key, dummy_entry(1));
+        assert_eq!(search.table.len(), TABLE_CAP);
+        assert!(!search.table.contains_key(&new_key));
+    }
+    #[test]
+    fn cached_entry_shares_line_allocation_instead_of_deep_cloning() {
+        let mut search = dummy_search();
+        let key = dummy_key(0);
+        search.store(key, dummy_entry(3));
+        let cached = search.table.get(&key).cloned().unwrap();
+        assert!(Rc::ptr_eq(&search.table[&key].line, &cached.line));
     }
 }
 
