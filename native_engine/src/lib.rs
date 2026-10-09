@@ -398,6 +398,31 @@ fn generate(
     }
 }
 
+/// Stream base-power (power <= 10, no hero/variant state) turns to `visitor`
+/// as they are produced, instead of materialising them into a `Vec` first.
+/// Only the caller decides whether this is worth it: Hermès's reachable
+/// worker-pair x build-target space is large enough that eagerly hashing
+/// and sorting all of it before any alpha-beta cutoff wastes real work (see
+/// profilage-hermes-20261009.md); every other base power's branching stays
+/// small enough that the single eager sort in `ordered_visit` is cheaper.
+fn visit_base(
+    s: &State,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+    visitor: &mut dyn FnMut(Turn) -> GResult,
+) -> GResult {
+    let mut gen = Generator {
+        deadline,
+        cancelled,
+        calls: 0,
+        limit: usize::MAX,
+        turns: Vec::new(),
+        produced: 0,
+        visitor: Some(visitor),
+    };
+    gen.generate(s)
+}
+
 fn evaluate(s: &State, player: usize) -> i32 {
     if s.winner >= 0 {
         return if s.winner as usize == player {
@@ -483,28 +508,6 @@ fn ordered_visit(
     cancelled: &dyn Fn() -> bool,
     visitor: &mut dyn FnMut(Turn) -> GResult,
 ) -> GResult {
-    if s.powers.iter().all(|&p| p <= 10)
-        && s.adonis == [-1; 3]
-        && s.counts == [2, 2]
-        && s.extra == special::Extra::default()
-        && s.resume.length == 0
-    {
-        let mut seen = HashSet::new();
-        let mut turns: Vec<_> = generate(s, Some(deadline), cancelled, usize::MAX)?
-            .into_iter()
-            .filter(|t| seen.insert(t.after))
-            .collect();
-        turns.sort_by_cached_key(|t| {
-            (
-                std::cmp::Reverse(preferred.is_some_and(|p| p.after == t.after)),
-                std::cmp::Reverse(evaluate(&t.after, s.player as usize)),
-            )
-        });
-        for turn in turns {
-            visitor(turn)?;
-        }
-        return Ok(());
-    }
     let mut seen = HashSet::new();
     if let Some(turn) = preferred {
         seen.insert(turn.after);
@@ -518,15 +521,29 @@ fn ordered_visit(
         }
         Ok(())
     };
-    advanced::visit(s, Some(deadline), cancelled, &mut |turn| {
+    let mut accumulate = |turn: Turn, batch: &mut Vec<Turn>| -> GResult {
         if seen.insert(turn.after) {
             batch.push(turn);
         }
         if batch.len() >= 24 {
-            flush(&mut batch)?;
+            flush(batch)?;
         }
         Ok(())
-    })?;
+    };
+    if s.powers.iter().all(|&p| p <= 10)
+        && s.adonis == [-1; 3]
+        && s.counts == [2, 2]
+        && s.extra == special::Extra::default()
+        && s.resume.length == 0
+    {
+        visit_base(s, Some(deadline), cancelled, &mut |turn| {
+            accumulate(turn, &mut batch)
+        })?;
+    } else {
+        advanced::visit(s, Some(deadline), cancelled, &mut |turn| {
+            accumulate(turn, &mut batch)
+        })?;
+    }
     flush(&mut batch)
 }
 
@@ -1027,6 +1044,64 @@ mod tests {
             .iter()
             .any(|t| t.actions.iter().any(|a| a.kind == 0 && a.worker == 0)
                 && t.actions.iter().any(|a| a.kind == 0 && a.worker == 1)));
+    }
+    fn hermes_initial() -> State {
+        let mut s = initial();
+        s.powers[0] = 7;
+        s
+    }
+    #[test]
+    fn hermes_streamed_visit_matches_full_generation() {
+        let state = hermes_initial();
+        let full: HashSet<State> = generate(&state, None, &|| false, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.after)
+            .collect();
+        // A regression guard needs a real branching space to be meaningful.
+        assert!(
+            full.len() > 1000,
+            "attendu un grand espace Hermès, obtenu {}",
+            full.len()
+        );
+        let mut streamed = HashSet::new();
+        visit_base(&state, None, &|| false, &mut |t| {
+            streamed.insert(t.after);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(full, streamed);
+    }
+    #[test]
+    fn ordered_visit_streams_hermes_without_losing_moves() {
+        let state = hermes_initial();
+        let all: HashSet<State> = generate(&state, None, &|| false, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.after)
+            .collect();
+        let mut seen = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        ordered_visit(&state, None, deadline, &|| false, &mut |t| {
+            seen.insert(t.after);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(all, seen);
+    }
+    #[test]
+    fn ordered_visit_still_visits_preferred_hermes_move_first() {
+        let state = hermes_initial();
+        let all = generate(&state, None, &|| false, usize::MAX).unwrap();
+        let preferred = all[all.len() / 2].clone();
+        let mut order = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        ordered_visit(&state, Some(&preferred), deadline, &|| false, &mut |t| {
+            order.push(t.after);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(order[0], preferred.after);
     }
     fn dummy_search() -> Search<'static> {
         Search {
