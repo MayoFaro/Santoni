@@ -531,6 +531,22 @@ fn canonical_key(s: &State) -> State {
     k
 }
 
+/// Batch size for the advanced/hero branch of `ordered_visit`. Its
+/// branching factor is small enough in practice that this is effectively a
+/// full sort in a single flush.
+const ADVANCED_BATCH: usize = 24;
+/// Batch size for the base-power branch of `ordered_visit`. Base powers
+/// other than Hermès have a branching factor well under 100 (80 at the
+/// very first move, shrinking as workers get boxed in), so this must stay
+/// above that to keep near-global move ordering -- and with it, the
+/// alpha-beta pruning quality the old eager `generate()` + global sort
+/// gave those powers for free. 256 is comfortably above that range while
+/// still being tiny next to Hermès's few-thousand-turn branching, where it
+/// still delivers the early-cutoff benefit `visit_base` exists for (see
+/// profilage-hermes-20261009.md for the measurement that picked this
+/// value over 24).
+const BASE_BATCH: usize = 256;
+
 fn ordered_visit(
     s: &State,
     preferred: Option<&Turn>,
@@ -543,7 +559,13 @@ fn ordered_visit(
         seen.insert(canonical_key(&turn.after));
         visitor(turn.clone())?;
     }
-    let mut batch: Vec<Turn> = Vec::with_capacity(24);
+    let is_base = s.powers.iter().all(|&p| p <= 10)
+        && s.adonis == [-1; 3]
+        && s.counts == [2, 2]
+        && s.extra == special::Extra::default()
+        && s.resume.length == 0;
+    let batch_size = if is_base { BASE_BATCH } else { ADVANCED_BATCH };
+    let mut batch: Vec<Turn> = Vec::with_capacity(batch_size);
     let mut flush = |batch: &mut Vec<Turn>| -> GResult {
         batch.sort_by_cached_key(|t| std::cmp::Reverse(evaluate(&t.after, s.player as usize)));
         for turn in batch.drain(..) {
@@ -555,17 +577,12 @@ fn ordered_visit(
         if seen.insert(canonical_key(&turn.after)) {
             batch.push(turn);
         }
-        if batch.len() >= 24 {
+        if batch.len() >= batch_size {
             flush(batch)?;
         }
         Ok(())
     };
-    if s.powers.iter().all(|&p| p <= 10)
-        && s.adonis == [-1; 3]
-        && s.counts == [2, 2]
-        && s.extra == special::Extra::default()
-        && s.resume.length == 0
-    {
+    if is_base {
         visit_base(s, Some(deadline), cancelled, &mut |turn| {
             accumulate(turn, &mut batch)
         })?;
@@ -1431,6 +1448,44 @@ mod tests {
                     total_ns as f64 / 1e6,
                     search.clone_ns as f64 / 1e6,
                     100.0 * search.clone_ns as f64 / total_ns as f64,
+                );
+            }
+        }
+    }
+    /// Mesure nœuds/temps pour atteindre une profondeur donnée, même
+    /// méthodologie que `docs/profilage-copies-pv-20261009.md` (profondeurs
+    /// 2 à 5, jeu sans pouvoir et Hermès, budget 30 s). Sert à comparer,
+    /// commit par commit, l'effet de la génération progressive
+    /// (`visit_base`, voir `ordered_visit`) et de la canonisation du swap
+    /// des deux bâtisseurs (`canonical_key`) sur Hermès. Voir
+    /// `docs/profilage-hermes-20261009.md`.
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_hermes_generation_cost() {
+        let hermes = {
+            let mut s = initial();
+            s.powers[0] = 7;
+            s
+        };
+        for (label, state) in [("sans pouvoir", initial()), ("hermes", hermes)] {
+            for depth in 2u32..=5 {
+                let mut search = dummy_search();
+                search.root = state.player as usize;
+                search.deadline = Instant::now() + Duration::from_secs(30);
+                let total_start = Instant::now();
+                let outcome = search.minimax(&state, depth, -2 * MATE, 2 * MATE, 0);
+                let total_ns = total_start.elapsed().as_nanos() as u64;
+                if outcome.is_err() {
+                    eprintln!(
+                        "{label:12} depth={depth} budget de 30s atteint avant la fin (nodes={})",
+                        search.nodes
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "{label:12} depth={depth} nodes={:>9} total={:>9.3}ms",
+                    search.nodes,
+                    total_ns as f64 / 1e6,
                 );
             }
         }
