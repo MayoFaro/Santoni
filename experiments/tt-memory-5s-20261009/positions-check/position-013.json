@@ -1,0 +1,664 @@
+{
+  "case": {
+    "id": "validation-054-011",
+    "group": "validation_unstudied_game",
+    "game": 54,
+    "ply": 11,
+    "position": {
+      "heights": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "domes": 8192,
+      "workers": [
+        [
+          7,
+          10
+        ],
+        [
+          12,
+          11
+        ]
+      ],
+      "powers": [
+        4,
+        9
+      ],
+      "player": 1,
+      "hero_used": [
+        false,
+        false
+      ],
+      "athena_lock": false,
+      "adonis": null,
+      "winner": null,
+      "reason": ""
+    },
+    "recorded_winner": 1,
+    "input_sha256": "bb7b271ec759a83f18314ad9b8288a30dcb5bbe4d91b44b9f9a09116f18eb426"
+  },
+  "seconds": 5.0,
+  "execution_order": [
+    "baseline",
+    "candidate"
+  ],
+  "results": {
+    "baseline": {
+      "score": 6,
+      "depth": 4,
+      "nodes": 104100,
+      "elapsed": 5.000521735,
+      "proven": false,
+      "stop_reason": "timeout",
+      "wall_elapsed": 5.002988816006109,
+      "attempted_depth": 5,
+      "binary_sha256": "95291daa38cc5a95a823b9f7afd3d6980f03e262d4b923d2f3c626e343359f48",
+      "turn": {
+        "actions": [
+          {
+            "kind": "move",
+            "player": 1,
+            "worker": 0,
+            "source": 12,
+            "target": 16
+          },
+          {
+            "kind": "build",
+            "player": 1,
+            "worker": 0,
+            "source": 16,
+            "target": 17
+          }
+        ],
+        "after": {
+          "heights": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "domes": 8192,
+          "workers": [
+            [
+              7,
+              10
+            ],
+            [
+              16,
+              11
+            ]
+          ],
+          "powers": [
+            4,
+            9
+          ],
+          "player": 0,
+          "hero_used": [
+            false,
+            false
+          ],
+          "athena_lock": false,
+          "adonis": null,
+          "winner": null,
+          "reason": ""
+        }
+      },
+      "variation": [
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 1,
+              "worker": 0,
+              "source": 12,
+              "target": 16
+            },
+            {
+              "kind": "build",
+              "player": 1,
+              "worker": 0,
+              "source": 16,
+              "target": 17
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              1,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              2,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                7,
+                10
+              ],
+              [
+                16,
+                11
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 0,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        },
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 0,
+              "worker": 0,
+              "source": 7,
+              "target": 12
+            },
+            {
+              "kind": "build",
+              "player": 0,
+              "worker": 0,
+              "source": 12,
+              "target": 17
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              1,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                12,
+                10
+              ],
+              [
+                16,
+                11
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 1,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        },
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 1,
+              "worker": 1,
+              "source": 11,
+              "target": 7
+            },
+            {
+              "kind": "build",
+              "player": 1,
+              "worker": 1,
+              "source": 7,
+              "target": 8
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              2,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                12,
+                10
+              ],
+              [
+                16,
+                7
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 0,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        }
+      ]
+    },
+    "candidate": {
+      "score": 6,
+      "depth": 4,
+      "nodes": 101255,
+      "elapsed": 5.000433517,
+      "proven": false,
+      "stop_reason": "timeout",
+      "wall_elapsed": 5.003362816001754,
+      "attempted_depth": 5,
+      "binary_sha256": "552b04bf6ce0810ddce169dc9a2c79e9301602e86d606a539c2eb3d6a89e631b",
+      "turn": {
+        "actions": [
+          {
+            "kind": "move",
+            "player": 1,
+            "worker": 0,
+            "source": 12,
+            "target": 16
+          },
+          {
+            "kind": "build",
+            "player": 1,
+            "worker": 0,
+            "source": 16,
+            "target": 17
+          }
+        ],
+        "after": {
+          "heights": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "domes": 8192,
+          "workers": [
+            [
+              7,
+              10
+            ],
+            [
+              16,
+              11
+            ]
+          ],
+          "powers": [
+            4,
+            9
+          ],
+          "player": 0,
+          "hero_used": [
+            false,
+            false
+          ],
+          "athena_lock": false,
+          "adonis": null,
+          "winner": null,
+          "reason": ""
+        }
+      },
+      "variation": [
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 1,
+              "worker": 0,
+              "source": 12,
+              "target": 16
+            },
+            {
+              "kind": "build",
+              "player": 1,
+              "worker": 0,
+              "source": 16,
+              "target": 17
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              1,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              2,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                7,
+                10
+              ],
+              [
+                16,
+                11
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 0,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        },
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 0,
+              "worker": 0,
+              "source": 7,
+              "target": 12
+            },
+            {
+              "kind": "build",
+              "player": 0,
+              "worker": 0,
+              "source": 12,
+              "target": 17
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              1,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                12,
+                10
+              ],
+              [
+                16,
+                11
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 1,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        },
+        {
+          "actions": [
+            {
+              "kind": "move",
+              "player": 1,
+              "worker": 1,
+              "source": 11,
+              "target": 7
+            },
+            {
+              "kind": "build",
+              "player": 1,
+              "worker": 1,
+              "source": 7,
+              "target": 8
+            }
+          ],
+          "after": {
+            "heights": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              1,
+              2,
+              0,
+              1,
+              0,
+              0,
+              1,
+              0,
+              0,
+              1,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "domes": 8192,
+            "workers": [
+              [
+                12,
+                10
+              ],
+              [
+                16,
+                7
+              ]
+            ],
+            "powers": [
+              4,
+              9
+            ],
+            "player": 0,
+            "hero_used": [
+              false,
+              false
+            ],
+            "athena_lock": false,
+            "adonis": null,
+            "winner": null,
+            "reason": ""
+          }
+        }
+      ]
+    }
+  }
+}

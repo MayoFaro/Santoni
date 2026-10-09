@@ -1,0 +1,8 @@
+{
+  "engine_commit": "cefb063",
+  "branch": "improve/tt-memory",
+  "binary_sha256": "552b04bf6ce0810ddce169dc9a2c79e9301602e86d606a539c2eb3d6a89e631b",
+  "lib_rs_sha256": "475d2e6d84a2c04dd1ff8671826e95a13ceefd837b62cf83772327eed566333c",
+  "change_summary": "Transposition table allows updating an existing key once full and displaces an arbitrary shallower entry for a new key instead of refusing insertion; Entry.line is Rc<Vec<Turn>> instead of Vec<Turn> to avoid deep-cloning the stored variation on every cache read.",
+  "build_command": "cargo build --release --manifest-path native_engine/Cargo.toml"
+}
