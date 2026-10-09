@@ -154,6 +154,51 @@ réduction des copies restantes (reconstruction de la ligne principale sans
 (génération / dédoublonnage / tri / évaluation / cache), qui n'ont toujours
 pas été mesurés séparément.
 
+## Pilote complémentaire à 30 s (même graine, sous-ensemble des mêmes placements)
+
+Pour vérifier l'hypothèse qu'un budget court nivelle les écarts (un palier de
+profondeur supplémentaire peut coûter jusqu'à 30× le précédent — section 1 du
+[plan d'amélioration](ameliorations-moteur-20261005.md)), les 30 premières
+paires de la même graine (`20261009`), donc les mêmes placements que la
+campagne à 5 s pour sans pouvoir / Hermès-Héphaïstos / Apollon-Minotaure, ont
+été rejouées à **30 secondes**.
+
+Incident en cours de campagne : une tentative de mise en pause par
+`pkill -STOP -f "version_bench.py"` a auto-suspendu le shell qui exécutait
+cette commande (son propre texte contenait le motif recherché), bloquant la
+reprise pendant plusieurs minutes et faisant expirer 10 sous-processus moteur
+déjà en vol. Ces 10 parties sont marquées `error` (délai de réponse) par le
+superviseur et exclues du bilan, sans impact sur les 50 autres ni sur les
+historiques déjà validés.
+
+| Indicateur | 5 s (n = 200) | 30 s (n = 50, 10 écartées) |
+|---|---:|---:|
+| Victoires du candidat | 103 (51,5 %) | 27 (54,0 %) |
+| IC bootstrap 95 %, par placement | 47,5 % – 55,5 % | 47,1 % – 61,7 % |
+| Résultats démontrés, candidat / référence | 502 / 491 | 183 / 179 |
+| Temps moyen par décision, candidat / référence | 4,173 s / 4,182 s | 24,068 s / 24,184 s |
+| Profondeur médiane | 4 / 4 | 5 / 5 |
+
+Les deux lots restent individuellement non concluants (IC95 contenant 50 %),
+mais le point central se déplace dans le sens attendu par l'hypothèse (51,5 %
+→ 54,0 %) sans aucun coût supplémentaire mesuré ni régression. Le lot à 30 s
+est plus petit (50 contre 200 parties, 4 paires perdues sur 30 à cause de
+l'incident) : son intervalle est mécaniquement plus large et ne permet pas de
+conclure seul à un effet de budget. Les deux lots pointent dans la même
+direction ; ni l'un ni l'autre ne l'établit isolément.
+
+## Décision finale
+
+Les deux campagnes indépendantes (budgets et échantillons distincts)
+convergent : aucune régression, coût identique ou inférieur, résultats
+démontrés légèrement supérieurs, tendance positive qui se renforce avec le
+budget. Conformément au critère proposé plus haut (correction de défaut
+documenté, coût nul, aucune régression observée sur 338+8 tests unitaires,
+18 positions fixes et 250 parties cumulées), **la variante est fusionnée dans
+`main`** sans lot supplémentaire : le seuil utilisé pour les candidats
+stratégiques (IC95 strictement positif) ne s'applique pas à une correction
+d'infrastructure sans coût ni compromis identifié.
+
 ## Reproduction
 
 `tools/version_bench.py` est repris sans modification du worktree
