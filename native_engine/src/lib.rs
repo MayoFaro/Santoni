@@ -469,6 +469,11 @@ struct Search<'a> {
     nodes: u64,
     root: usize,
     table: HashMap<(State, u32), Entry>,
+    /// Nanoseconds spent in the per-node PV clone (`Rc::new(line.clone())`
+    /// in `minimax`). Only incremented and read with the `profile` feature
+    /// (see `profile_pv_clone_cost`); unread and always 0 otherwise.
+    #[allow(dead_code)]
+    clone_ns: u64,
 }
 
 fn ordered_visit(
@@ -675,13 +680,20 @@ impl Search<'_> {
         } else {
             0
         };
+        #[cfg(feature = "profile")]
+        let clone_start = Instant::now();
+        let shared_line = Rc::new(line.clone());
+        #[cfg(feature = "profile")]
+        {
+            self.clone_ns += clone_start.elapsed().as_nanos() as u64;
+        }
         self.store(
             key,
             Entry {
                 depth,
                 value,
                 flag,
-                line: Rc::new(line.clone()),
+                line: shared_line,
             },
         );
         Ok((value, line))
@@ -792,6 +804,7 @@ pub unsafe extern "C" fn santoni_search(
         nodes: 0,
         root: s.player as usize,
         table: HashMap::new(),
+        clone_ns: 0,
     };
     if s.extra.event == 1 {
         *output = search.output(&[], None, 0, true, 6, &s);
@@ -1023,6 +1036,7 @@ mod tests {
             nodes: 0,
             root: 0,
             table: HashMap::new(),
+            clone_ns: 0,
         }
     }
     fn dummy_key(tag: u32) -> (State, u32) {
@@ -1087,6 +1101,53 @@ mod tests {
         search.store(key, dummy_entry(3));
         let cached = search.table.get(&key).cloned().unwrap();
         assert!(Rc::ptr_eq(&search.table[&key].line, &cached.line));
+    }
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_pv_clone_cost() {
+        let hermes = {
+            let mut s = initial();
+            s.powers[0] = 7;
+            s
+        };
+        // Hermès's branching factor (~50x the no-power game, per
+        // ameliorations-moteur-20261005.md) can exceed this budget by itself
+        // at depth 3-4; a timeout there is an expected, informative result
+        // about generation cost, not a bug in this diagnostic.
+        for (label, state, depths) in [
+            ("sans pouvoir", initial(), &[3u32, 4, 5][..]),
+            ("hermes", hermes, &[2u32, 3][..]),
+        ] {
+            for &depth in depths {
+                let mut search = Search {
+                    started: Instant::now(),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    cancelled: &|| false,
+                    nodes: 0,
+                    root: state.player as usize,
+                    table: HashMap::new(),
+                    clone_ns: 0,
+                };
+                let total_start = Instant::now();
+                let outcome = search.minimax(&state, depth, -2 * MATE, 2 * MATE, 0);
+                let total_ns = total_start.elapsed().as_nanos() as u64;
+                if outcome.is_err() {
+                    eprintln!("{label:12} depth={depth} budget de 30s atteint avant la fin (nodes={})", search.nodes);
+                    continue;
+                }
+                assert!(
+                    search.clone_ns <= total_ns,
+                    "le temps de clonage ne peut pas dépasser le temps total"
+                );
+                eprintln!(
+                    "{label:12} depth={depth} nodes={:>9} total={:>9.3}ms clone={:>8.3}ms ({:>5.1}%)",
+                    search.nodes,
+                    total_ns as f64 / 1e6,
+                    search.clone_ns as f64 / 1e6,
+                    100.0 * search.clone_ns as f64 / total_ns as f64,
+                );
+            }
+        }
     }
 }
 
@@ -1182,6 +1243,7 @@ pub unsafe extern "C" fn santoni_expectation(
         nodes: 0,
         root: s.extra.return_player as usize,
         table: HashMap::new(),
+        clone_ns: 0,
     };
     let mut score = None;
     let mut completed = 0;
@@ -1274,6 +1336,7 @@ pub unsafe extern "C" fn santoni_choose_secret(
         nodes: 0,
         root: 1,
         table: HashMap::new(),
+        clone_ns: 0,
     };
     let cells: Vec<i8> = (0..25)
         .filter(|&c| {
