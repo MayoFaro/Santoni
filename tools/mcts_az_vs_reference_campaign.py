@@ -59,9 +59,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
+
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'experiments/references/b698745'
@@ -72,6 +75,8 @@ sys.path.insert(0, str(ROOT))
 from santorini.engine import Action, Position, terminal_position, validate_setup, validate_turn  # noqa: E402
 from santorini.native import ACTION_KINDS, encode, CAction, native_search  # noqa: E402
 from santorini import native  # noqa: E402
+from santoni_az.network import PolicyValueNet  # noqa: E402
+from santoni_az.inference_server import InferenceServer  # noqa: E402
 
 
 def digest(path):
@@ -115,6 +120,36 @@ def freeze_reference(directory):
     return binary, frozen
 
 
+def load_checkpoint_net(path):
+    data = torch.load(path, weights_only=False)
+    net = PolicyValueNet()
+    net.load_state_dict(data['model_state'])
+    net.eval()
+    return net
+
+
+def freeze_checkpoint(directory, checkpoint_path):
+    """Snapshot the checkpoint file currently at `checkpoint_path` into the
+    campaign directory, exactly the same rationale as `freeze_reference`
+    above applied to the candidate side: pin precisely what is being
+    measured, so a checkpoint file changing on disk mid-campaign (e.g.
+    training continuing to write to the same path, or simply pointing a
+    resumed run at a different file) can never silently change what 'the
+    candidate' means partway through, and is caught loudly instead."""
+    target = directory / 'candidate'
+    target.mkdir(exist_ok=True)
+    binary = target / 'checkpoint.pt'
+    manifest = target / 'manifest.json'
+    if not manifest.exists():
+        shutil.copy2(checkpoint_path, binary)
+        generation = torch.load(binary, weights_only=False)['generation']
+        atomic_json(manifest, {'checkpoint_sha256': digest(binary), 'generation': generation})
+    frozen = json.loads(manifest.read_text())
+    if digest(binary) != frozen['checkpoint_sha256']:
+        raise ValueError('Candidate checkpoint snapshot integrity mismatch')
+    return binary, frozen
+
+
 def set_engine(lib):
     if os.environ.get('SANTONI_ENGINE_LIB') != str(lib):
         os.environ['SANTONI_ENGINE_LIB'] = str(lib)
@@ -139,7 +174,7 @@ def bootstrap(groups):
     return [samples[125], samples[4874]]
 
 
-def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
+def candidate_move(position, seconds, socket_path, scratch_dir):
     state = encode(position)
     input_path = scratch_dir / 'state.bin'
     output_path = scratch_dir / 'move.bin'
@@ -147,9 +182,8 @@ def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
     if output_path.exists():
         output_path.unlink()
     cmd = [str(WORKER_BINARY), '--single-move', '--input-state', str(input_path),
-           '--output-move', str(output_path), '--seconds', str(seconds)]
-    if socket_path:
-        cmd += ['--inference-socket', str(socket_path)]
+           '--output-move', str(output_path), '--seconds', str(seconds),
+           '--inference-socket', str(socket_path)]
     started = time.monotonic()
     result = subprocess.run(cmd, timeout=seconds + 10, capture_output=True, text=True)
     if result.returncode != 0:
@@ -188,7 +222,7 @@ def reference_move(position, seconds, reference_binary):
     return analysis.turn, analysis.elapsed
 
 
-def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, reference_binary):
+def play(job, directory, seconds, socket_path, scratch_dir, reference_binary):
     initial = job['initial']
     path = Path(directory) / f"game-{job['number']:04d}.json"
     position = validate_setup(initial['workers'], initial['powers'], initial['first'])
@@ -202,7 +236,7 @@ def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, referenc
                 break
             is_candidate = position.player == job['variant_player']
             if is_candidate:
-                turn, elapsed = candidate_move(position, seconds, checkpoint, socket_path, scratch_dir)
+                turn, elapsed = candidate_move(position, seconds, socket_path, scratch_dir)
             else:
                 turn, elapsed = reference_move(position, seconds, reference_binary)
             data['decisions'].append({'ply': ply + 1, 'player': position.player,
@@ -282,9 +316,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--seconds', type=float, default=30.0)
-    parser.add_argument('--inference-socket', default=None,
-                         help='Socket du serveur d\'inférence déjà démarré ; sans cette option, '
-                              'le worker utilise un évaluateur uniforme (politique aléatoire).')
     parser.add_argument('--out', required=True)
     parser.add_argument('--limit', type=int, default=None,
                          help='Only run the first N scheduled games (pilot runs); '
@@ -295,6 +326,15 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     reference_binary, reference_manifest = freeze_reference(directory)
     print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
+    candidate_binary, candidate_manifest = freeze_checkpoint(directory, Path(args.checkpoint))
+    net = load_checkpoint_net(candidate_binary)
+    socket_path = str(directory / 'infer.sock')
+    server = InferenceServer(socket_path, net)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    time.sleep(0.1)
+    print(f"CANDIDATE checkpoint generation={candidate_manifest['generation']} "
+          f"sha256={candidate_manifest['checkpoint_sha256']}", flush=True)
     corpus = json.loads(CORPUS.read_text())
     jobs_all = corpus['jobs']
     check_corpus_is_no_power(jobs_all)
@@ -302,11 +342,13 @@ def main():
             for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
     if args.limit:
         jobs = jobs[:args.limit]
-    with tempfile.TemporaryDirectory() as scratch:
-        scratch_dir = Path(scratch)
-        results = [play(job, directory, args.seconds, args.checkpoint, args.inference_socket, scratch_dir,
-                         reference_binary)
-                   for job in jobs]
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch_dir = Path(scratch)
+            results = [play(job, directory, args.seconds, socket_path, scratch_dir, reference_binary)
+                       for job in jobs]
+    finally:
+        server.stop()
     result = summary(directory, corpus)
     report(directory, result)
     print(json.dumps(result, indent=2))
