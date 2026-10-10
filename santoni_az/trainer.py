@@ -46,6 +46,7 @@ class Trainer:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        del self._examples[:len(batch)]
         return float(loss.item())
 
     def save_checkpoint(self):
@@ -57,6 +58,7 @@ class Trainer:
             "model_state": self.net.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "consumed_games": sorted(self._consumed_games),
+            "examples": self._examples,
         }, tmp)
         os.replace(tmp, path)
         return str(path)
@@ -70,4 +72,5 @@ class Trainer:
         self.optimizer.load_state_dict(data["optimizer_state"])
         self.generation = data["generation"]
         self._consumed_games = set(data["consumed_games"])
+        self._examples = data["examples"]
         return self.generation
