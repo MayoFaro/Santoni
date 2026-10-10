@@ -300,7 +300,23 @@ fn main() {
             break;
         }
         let record = play_one_game(simulations_per_move, evaluator.as_mut());
-        let path = out_dir.join(format!("game-{:04}.json", i));
+        // Le PID dans le nom de fichier rend le nom globalement unique, sans
+        // aucune coordination entre workers. `game-{:04}.json` (compteur
+        // local repartant de 0 à chaque processus) collisionnait dans deux
+        // situations très réelles :
+        //   - `worker_count > 1` (orchestrateur) : N processus écrivent tous
+        //     `game-0000.json` dans le même `run_dir/games` ;
+        //   - reprise après arrêt : le nouveau processus repart de 0 et
+        //     écrase les parties de la session précédente.
+        // Dans les deux cas la perte est silencieuse *et* invisible pour
+        // l'entraîneur : `Trainer._consumed_games` est indexé par nom de
+        // fichier et contient déjà l'ancien nom, donc le nouveau contenu au
+        // même chemin n'est jamais relu. Un PID est distinct pour chaque
+        // processus vivant et change au redémarrage : il ferme les deux
+        // trous d'un coup. Le préfixe `game-` et le suffixe `.json` sont
+        // conservés pour que tous les `glob("game-*.json")` existants
+        // (trainer, orchestrateur, tests) continuent de matcher.
+        let path = out_dir.join(format!("game-{}-{:06}.json", std::process::id(), i));
         write_game_atomically(&path, &record).expect("écriture de partie impossible");
     }
 }
