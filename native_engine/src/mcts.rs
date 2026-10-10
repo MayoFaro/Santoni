@@ -11,7 +11,7 @@ pub fn is_in_scope(s: &State) -> bool {
 /// Réutilise `generate`/`apply`, déjà différentiel-testés (tests/test_native.py) —
 /// aucune règle n'est réimplémentée ici.
 pub fn legal_children(s: &State) -> Vec<(Action, Action, State)> {
-    debug_assert!(is_in_scope(s));
+    assert!(is_in_scope(s));
     generate(s, None, &|| false, usize::MAX)
         .unwrap()
         .into_iter()
@@ -26,6 +26,7 @@ pub fn legal_children(s: &State) -> Vec<(Action, Action, State)> {
 /// `Some(-1)` s'il a perdu — y compris par absence de coup légal (pas de pat
 /// dans Santorini de base : qui ne peut pas jouer perd).
 pub fn terminal_value(s: &State, to_move: u8) -> Option<i32> {
+    assert!(is_in_scope(s));
     if s.winner != -1 {
         return Some(if s.winner as u8 == to_move { 1 } else { -1 });
     }
@@ -36,6 +37,7 @@ pub fn terminal_value(s: &State, to_move: u8) -> Option<i32> {
 }
 
 pub fn encode_planes(s: &State) -> [u8; PLANE_BYTES] {
+    assert!(is_in_scope(s));
     let mut planes = [0u8; PLANE_BYTES];
     let me = s.player as usize;
     let foe = 1 - me;
