@@ -1,7 +1,45 @@
-use crate::{generate, Action, State};
+use crate::{generate, special, Action, State};
 
 pub const PLANE_BYTES: usize = 150;
 pub const ACTION_SPACE: usize = 1250;
+
+/// Plateau vide avec toutes les sentinelles neutres attendues par
+/// `generate` (`adonis == [-1; 3]`, `extra == Extra::default()`,
+/// `resume.length == 0`) plutôt qu'un `std::mem::zeroed()` : ce dernier
+/// laisse `adonis`/`extra` à zéro, ce qui fait basculer `generate` sur le
+/// chemin `advanced::generate` et peut produire des coups pour le mauvais
+/// bâtisseur (ce même piège est déjà documenté sur
+/// `mcts_tree_tests::default_state` plus bas dans ce fichier, et évité par
+/// `lib.rs::tests::initial`). Défini ici (plutôt que dans `lib.rs`, où les
+/// contraintes du plan interdisent toute modification au-delà des deux
+/// `pub mod` des Tasks 1/3) grâce à la règle d'orphelin de Rust : `Default`
+/// est un trait étranger (`std`) mais `State` est un type local à ce
+/// crate, donc `impl Default for State` est permis depuis n'importe quel
+/// module du crate — y compris `mcts`, qui a accès au module privé
+/// `special` en tant que descendant de la racine du crate qui le déclare.
+/// Exposé publiquement pour que du code hors crate — ex.
+/// `bin/selfplay_worker.rs`, qui a besoin d'un état de départ valide pour
+/// une partie d'auto-jeu — puisse construire un état de départ correct
+/// sans avoir accès au module privé `special`.
+impl Default for State {
+    fn default() -> Self {
+        State {
+            heights: [0; 25],
+            domes: 0,
+            workers: [[-1; 4]; 2],
+            counts: [2, 2],
+            powers: [0, 0],
+            player: 0,
+            hero_used: [0, 0],
+            athena_lock: 0,
+            adonis: [-1, -1, -1],
+            winner: -1,
+            reason: 0,
+            extra: special::Extra::default(),
+            resume: special::Resume::default(),
+        }
+    }
+}
 
 pub fn is_in_scope(s: &State) -> bool {
     s.powers == [0, 0] && s.counts == [2, 2]
