@@ -113,9 +113,127 @@ fn initial_state() -> State {
     }
 }
 
-fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -> GameRecord {
+/// Bruit de Dirichlet au niveau de la racine + température d'ouverture :
+/// sans ceci, le MCTS self-play est entièrement déterministe (mêmes
+/// priors, même UCB, même coup choisi à chaque partie) — vérifié en revue
+/// finale du chantier initial : 4 parties self-play produisaient des
+/// fichiers strictement identiques. `DIRICHLET_ALPHA`/`DIRICHLET_EPSILON`
+/// reprennent les valeurs standard AlphaZero pour un facteur de branchement
+/// modéré (échecs : alpha=0.3, epsilon=0.25). `TEMPERATURE_PLIES` limite
+/// l'échantillonnage proportionnel aux visites aux tout premiers coups de
+/// la partie ; au-delà, exploitation pure (argmax), comme dans AlphaZero
+/// une fois l'ouverture passée.
+const DIRICHLET_ALPHA: f32 = 0.3;
+const DIRICHLET_EPSILON: f32 = 0.25;
+const TEMPERATURE_PLIES: usize = 6;
+
+/// Générateur xorshift64* minimal (aucune dépendance externe — règle du
+/// projet). N'a pas besoin d'être cryptographiquement sûr : seul le service
+/// rendu est de casser le déterminisme entre parties/process, pas une
+/// garantie de sécurité.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed } }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Flottant uniforme dans [0, 1).
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// Normale standard (Box-Muller), utilisée par `gamma_sample`.
+    fn next_normal(&mut self) -> f64 {
+        let u1 = self.next_f64().max(1e-12);
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+}
+
+/// Graine distincte par partie et par processus : PID (distinct entre
+/// workers concurrents, change au redémarrage — même raisonnement que le
+/// nom de fichier des parties, cf. `main` plus bas), index de partie, et
+/// horloge système, combinés par hachage plutôt que concaténés
+/// arithmétiquement pour éviter toute structure visible entre graines
+/// consécutives.
+fn seed_for_game(game_index: u32) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    game_index.hash(&mut hasher);
+    std::time::SystemTime::now().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Échantillonne une loi Gamma(shape, 1) par la méthode de Marsaglia-Tsang
+/// (2000), avec le correctif usuel pour `shape < 1` (Y = X · U^(1/shape),
+/// X ~ Gamma(shape+1, 1)).
+fn gamma_sample(rng: &mut Xorshift64, shape: f64) -> f64 {
+    if shape < 1.0 {
+        let u = rng.next_f64().max(1e-12);
+        return gamma_sample(rng, shape + 1.0) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let (x, v) = loop {
+            let x = rng.next_normal();
+            let v = 1.0 + c * x;
+            if v > 0.0 {
+                break (x, v);
+            }
+        };
+        let v3 = v * v * v;
+        let u = rng.next_f64();
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+            return d * v3;
+        }
+    }
+}
+
+/// Échantillon de Dirichlet(alpha, ..., alpha) sur `n` catégories : `n`
+/// tirages Gamma(alpha, 1) indépendants, normalisés à somme 1. `n == 1` est
+/// un cas valide (ply à un seul coup légal) : le seul tirage se normalise
+/// trivialement à 1.0.
+fn dirichlet_noise(rng: &mut Xorshift64, n: usize, alpha: f32) -> Vec<f32> {
+    let samples: Vec<f64> = (0..n).map(|_| gamma_sample(rng, alpha as f64).max(1e-9)).collect();
+    let total: f64 = samples.iter().sum();
+    samples.iter().map(|s| (s / total) as f32).collect()
+}
+
+/// Tirage pondéré par `weights` (ex. les nombres de visites MCTS) : plus un
+/// coup a été visité, plus il a de chances d'être choisi. `weights` doit
+/// être non vide avec une somme strictement positive.
+fn sample_weighted(rng: &mut Xorshift64, weights: &[u32]) -> usize {
+    let total: u64 = weights.iter().map(|&w| w as u64).sum();
+    assert!(total > 0, "sample_weighted appelé avec des poids tous nuls");
+    let mut r = (rng.next_f64() * total as f64) as u64;
+    for (i, &w) in weights.iter().enumerate() {
+        if r < w as u64 {
+            return i;
+        }
+        r -= w as u64;
+    }
+    weights.len() - 1
+}
+
+fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, rng_seed: u64) -> GameRecord {
     let mut state = initial_state();
     let mut positions = Vec::new();
+    let mut rng = Xorshift64::new(rng_seed);
     loop {
         // `terminal_value(&state, 0)` (the plan brief's literal check) misses
         // the case where player 1 is the one with no legal move: its
@@ -135,6 +253,10 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -
         }
         let planes = santoni_engine::mcts::encode_planes(&state);
         let mut mcts = Mcts::new(state, 1.5);
+        mcts.ensure_root_expanded(evaluator);
+        let n_edges = mcts.visit_counts().len();
+        let noise = dirichlet_noise(&mut rng, n_edges, DIRICHLET_ALPHA);
+        mcts.mix_root_noise(&noise, DIRICHLET_EPSILON);
         mcts.run(simulations_per_move, evaluator);
         let counts = mcts.visit_counts();
         let legal = legal_children(&state);
@@ -148,8 +270,13 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -
                 (santoni_engine::mcts::action_index(mv, bld, worker_slot), *n)
             })
             .collect();
-        let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
-        let (_, _, after) = legal[best];
+        let chosen = if positions.len() < TEMPERATURE_PLIES {
+            let weights: Vec<u32> = counts.iter().map(|(_, _, n)| *n).collect();
+            sample_weighted(&mut rng, &weights)
+        } else {
+            counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0
+        };
+        let (_, _, after) = legal[chosen];
         positions.push(PositionRecord { planes, visits });
         state = after;
     }
@@ -303,7 +430,7 @@ fn main() {
         if INTERRUPTED.load(Ordering::SeqCst) {
             break;
         }
-        let record = play_one_game(simulations_per_move, evaluator.as_mut());
+        let record = play_one_game(simulations_per_move, evaluator.as_mut(), seed_for_game(i));
         // Le PID dans le nom de fichier rend le nom globalement unique, sans
         // aucune coordination entre workers. `game-{:04}.json` (compteur
         // local repartant de 0 à chaque processus) collisionnait dans deux
@@ -391,5 +518,64 @@ mod socket_evaluator_tests {
         }
 
         let _ = std::fs::remove_file(&socket_path);
+    }
+}
+
+#[cfg(test)]
+mod exploration_tests {
+    use super::*;
+
+    #[test]
+    fn same_seed_reproduces_the_same_game() {
+        let mut eval_a = UniformEvaluator;
+        let mut eval_b = UniformEvaluator;
+        let a = play_one_game(4, &mut eval_a, 12345);
+        let b = play_one_game(4, &mut eval_b, 12345);
+        assert_eq!(a.outcome, b.outcome);
+        assert_eq!(a.positions.len(), b.positions.len());
+        for (pa, pb) in a.positions.iter().zip(&b.positions) {
+            assert_eq!(pa.planes, pb.planes);
+            assert_eq!(pa.visits, pb.visits);
+        }
+    }
+
+    #[test]
+    fn different_seeds_produce_different_games() {
+        let mut eval_a = UniformEvaluator;
+        let mut eval_b = UniformEvaluator;
+        let a = play_one_game(4, &mut eval_a, 1);
+        let b = play_one_game(4, &mut eval_b, 2);
+        assert!(!a.positions.is_empty());
+        assert!(!b.positions.is_empty());
+        // Avant ce correctif, 4 parties self-play produisaient des fichiers
+        // strictement identiques (revue finale du chantier initial) quelle
+        // que soit la graine, puisqu'aucune n'était même consultée.
+        let diverges = a.positions.len() != b.positions.len()
+            || a.positions.iter().zip(&b.positions).any(|(pa, pb)| pa.planes != pb.planes);
+        assert!(diverges, "deux graines distinctes doivent produire des trajectoires différentes");
+    }
+
+    #[test]
+    fn dirichlet_noise_sums_to_one_and_has_one_entry_per_category() {
+        let mut rng = Xorshift64::new(42);
+        let noise = dirichlet_noise(&mut rng, 5, DIRICHLET_ALPHA);
+        assert_eq!(noise.len(), 5);
+        let total: f32 = noise.iter().sum();
+        assert!((total - 1.0).abs() < 1e-4, "la somme du bruit de Dirichlet doit être 1, trouvé {total}");
+    }
+
+    #[test]
+    fn dirichlet_noise_handles_a_single_category_without_panicking() {
+        let mut rng = Xorshift64::new(7);
+        let noise = dirichlet_noise(&mut rng, 1, DIRICHLET_ALPHA);
+        assert_eq!(noise, vec![1.0]);
+    }
+
+    #[test]
+    fn sample_weighted_always_returns_the_only_index_when_forced() {
+        let mut rng = Xorshift64::new(99);
+        for _ in 0..20 {
+            assert_eq!(sample_weighted(&mut rng, &[7]), 0);
+        }
     }
 }
