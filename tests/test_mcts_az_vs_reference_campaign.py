@@ -36,7 +36,7 @@ def test_play_resolves_a_stuck_candidate_as_a_loss_without_invoking_either_engin
 
     job = {'number': 1, 'variant_player': 0,
            'initial': {'workers': [[12, 13], [0, 1]], 'powers': [0, 0], 'first': 0}}
-    result = campaign.play(job, tmp_path, 2.0, 'unused-socket', tmp_path, 'unused-reference')
+    result = campaign.play(job, tmp_path, 2.0, 'unused-socket', 'unused-reference')
 
     assert result['status'] == 'finished'
     assert result['variant_won'] is False  # variant_player 0 is the stuck player
@@ -54,7 +54,7 @@ def test_play_resolves_a_stuck_reference_as_a_win_for_the_candidate(tmp_path, mo
 
     job = {'number': 2, 'variant_player': 0,
            'initial': {'workers': [[0, 1], [12, 13]], 'powers': [0, 0], 'first': 0}}
-    result = campaign.play(job, tmp_path, 2.0, 'unused-socket', tmp_path, 'unused-reference')
+    result = campaign.play(job, tmp_path, 2.0, 'unused-socket', 'unused-reference')
 
     assert result['status'] == 'finished'
     assert result['variant_won'] is True  # variant_player 0 is the candidate; player 1 (reference) is stuck

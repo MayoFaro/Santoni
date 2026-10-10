@@ -50,8 +50,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes as C
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import hashlib
 import json
+import multiprocessing
 import os
 import random
 import shutil
@@ -222,28 +224,30 @@ def reference_move(position, seconds, reference_binary):
     return analysis.turn, analysis.elapsed
 
 
-def play(job, directory, seconds, socket_path, scratch_dir, reference_binary):
+def play(job, directory, seconds, socket_path, reference_binary):
     initial = job['initial']
     path = Path(directory) / f"game-{job['number']:04d}.json"
     position = validate_setup(initial['workers'], initial['powers'], initial['first'])
     data = {'job': job, 'status': 'running', 'decisions': []}
     atomic_json(path, data)
     try:
-        for ply in range(150):
-            checked = terminal_position(position)
-            if checked.winner is not None:
-                position = checked
-                break
-            is_candidate = position.player == job['variant_player']
-            if is_candidate:
-                turn, elapsed = candidate_move(position, seconds, socket_path, scratch_dir)
-            else:
-                turn, elapsed = reference_move(position, seconds, reference_binary)
-            data['decisions'].append({'ply': ply + 1, 'player': position.player,
-                                       'backend': 'candidate' if is_candidate else 'reference',
-                                       'elapsed': elapsed})
-            position = turn.after
-            atomic_json(path, {**data, 'position': position.to_dict()})
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch_dir = Path(scratch)
+            for ply in range(150):
+                checked = terminal_position(position)
+                if checked.winner is not None:
+                    position = checked
+                    break
+                is_candidate = position.player == job['variant_player']
+                if is_candidate:
+                    turn, elapsed = candidate_move(position, seconds, socket_path, scratch_dir)
+                else:
+                    turn, elapsed = reference_move(position, seconds, reference_binary)
+                data['decisions'].append({'ply': ply + 1, 'player': position.player,
+                                           'backend': 'candidate' if is_candidate else 'reference',
+                                           'elapsed': elapsed})
+                position = turn.after
+                atomic_json(path, {**data, 'position': position.to_dict()})
         data['status'] = 'finished' if position.winner is not None else 'inconclusive'
     except Exception as exc:
         data.update(status='error', error=f'{type(exc).__name__}: {exc}')
@@ -348,15 +352,33 @@ def check_corpus_is_no_power(jobs_all):
         raise ValueError(f'Corpus {CORPUS} contains no job')
 
 
+def physical_cpus():
+    cores = {}
+    for cpu in sorted(os.sched_getaffinity(0)):
+        base = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+        key = ((base / 'physical_package_id').read_text(), (base / 'core_id').read_text())
+        cores.setdefault(key, cpu)
+    return list(cores.values())
+
+
+def initialize(cpus):
+    os.nice(10)
+    identity = multiprocessing.current_process()._identity[0]
+    os.sched_setaffinity(0, {cpus[(identity - 1) % len(cpus)]})
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--seconds', type=float, default=30.0)
     parser.add_argument('--out', required=True)
+    parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--limit', type=int, default=None,
                          help='Only run the first N scheduled games (pilot runs); '
                               'same convention as tools/hermes_canonicalisation_campaign.py --limit.')
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error('workers must be positive')
     verify_reference()
     directory = Path(args.out)
     directory.mkdir(parents=True, exist_ok=True)
@@ -391,16 +413,27 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     pending = compute_pending_jobs(directory, jobs)
+    cpus = physical_cpus()[:args.workers]
+    print(f'START {len(pending)}/{len(jobs)} remaining; {args.seconds}s/move; CPUs {cpus}', flush=True)
     try:
-        with tempfile.TemporaryDirectory() as scratch:
-            scratch_dir = Path(scratch)
-            results = [play(job, directory, args.seconds, socket_path, scratch_dir, reference_binary)
-                       for job in pending]
+        with ProcessPoolExecutor(max_workers=len(cpus), mp_context=multiprocessing.get_context('spawn'),
+                                  initializer=initialize, initargs=(cpus,)) as pool:
+            futures = {pool.submit(play, job, str(directory), args.seconds, socket_path, str(reference_binary))
+                       for job in pending}
+            while futures:
+                done, futures = wait(futures, timeout=30, return_when=FIRST_COMPLETED)
+                for future in done:
+                    print('GAME ' + json.dumps(future.result()), flush=True)
+                result = summary(directory, corpus)
+                report(directory, result)
+                print(f"PROGRESS {result['completed']}/{len(jobs)}; errors={len(result['errors'])}", flush=True)
     finally:
         server.stop()
     result = summary(directory, corpus)
     report(directory, result)
-    print(json.dumps(result, indent=2))
+    print('FINAL ' + json.dumps(result, ensure_ascii=False), flush=True)
+    if result['completed'] != len(jobs):
+        raise SystemExit('Campaign requires review: incomplete games')
 
 
 if __name__ == '__main__':
