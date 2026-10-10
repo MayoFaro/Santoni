@@ -46,6 +46,37 @@ pub struct State {
     pub resume: special::Resume,
 }
 
+/// Plateau vide avec toutes les sentinelles neutres attendues par
+/// `generate` (`adonis == [-1; 3]`, `extra == Extra::default()`,
+/// `resume.length == 0`) plutôt qu'un `std::mem::zeroed()` : ce dernier
+/// laisse `adonis`/`extra` à zéro, ce qui fait basculer `generate` sur le
+/// chemin `advanced::generate` et peut produire des coups pour le mauvais
+/// bâtisseur (ce même piège est déjà documenté sur
+/// `mcts::mcts_tree_tests::default_state` et évité par `tests::initial`
+/// ci-dessous). Exposé publiquement pour que du code hors crate — ex.
+/// `bin/selfplay_worker.rs`, qui a besoin d'un état de départ valide pour
+/// une partie d'auto-jeu — puisse construire un état de départ correct
+/// sans avoir accès au module privé `special`.
+impl Default for State {
+    fn default() -> Self {
+        State {
+            heights: [0; 25],
+            domes: 0,
+            workers: [[-1; 4]; 2],
+            counts: [2, 2],
+            powers: [0, 0],
+            player: 0,
+            hero_used: [0, 0],
+            athena_lock: 0,
+            adonis: [-1, -1, -1],
+            winner: -1,
+            reason: 0,
+            extra: special::Extra::default(),
+            resume: special::Resume::default(),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub struct Action {

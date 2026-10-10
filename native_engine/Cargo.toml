@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "selfplay_worker"
+path = "src/bin/selfplay_worker.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

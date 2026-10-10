@@ -7,7 +7,16 @@ pub fn is_in_scope(s: &State) -> bool {
     s.powers == [0, 0] && s.counts == [2, 2]
 }
 
-/// Chaque tour du sous-jeu sans pouvoir est exactement [déplacement, construction].
+/// Chaque tour du sous-jeu sans pouvoir est [déplacement, construction] —
+/// sauf lorsque le déplacement monte sur une case de hauteur 3 : la partie
+/// se termine immédiatement (`apply` positionne `winner`) et `Generator::
+/// builds` (lib.rs) clôt le tour sans jamais émettre d'action de
+/// construction (`t.actions.len() == 1`). Pour conserver la forme fixe
+/// `(Action, Action, State)` attendue par `Mcts`/`action_index` sans
+/// propager un `Option<Action>` dans toute l'API déjà testée des Tasks 1-2,
+/// on synthétise une construction factice ciblant la case d'arrivée du
+/// déplacement : elle n'est jamais appliquée (l'état `t.after` est déjà
+/// terminal) et ne sert qu'à produire un `action_index` défini.
 /// Réutilise `generate`/`apply`, déjà différentiel-testés (tests/test_native.py) —
 /// aucune règle n'est réimplémentée ici.
 pub fn legal_children(s: &State) -> Vec<(Action, Action, State)> {
@@ -16,8 +25,18 @@ pub fn legal_children(s: &State) -> Vec<(Action, Action, State)> {
         .unwrap()
         .into_iter()
         .map(|t| {
-            assert_eq!(t.actions.len(), 2, "tour hors périmètre sans-pouvoir");
-            (t.actions[0], t.actions[1], t.after)
+            assert!(
+                t.actions.len() == 1 || t.actions.len() == 2,
+                "tour hors périmètre sans-pouvoir"
+            );
+            let mv = t.actions[0];
+            let bld = if t.actions.len() == 2 {
+                t.actions[1]
+            } else {
+                debug_assert!(t.after.winner >= 0, "tour à une action sans victoire immédiate");
+                Action { kind: 1, player: mv.player, worker: mv.worker, source: mv.target, target: mv.target }
+            };
+            (mv, bld, t.after)
         })
         .collect()
 }
