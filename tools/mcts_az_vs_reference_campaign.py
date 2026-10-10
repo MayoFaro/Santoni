@@ -15,6 +15,20 @@ au lieu de supposer `"move"`/`"build"` en dur (risque signalé par la revue de
 la Task 11, qui ne l'avait pas détecté : son propre test ne couvre que la
 position de départ fixe, où un tour gagnant en un coup ne peut jamais se
 clore par un dôme).
+
+Moteur de référence : le côté référence passe par `freeze_reference`, qui
+copie le `.so` *actuellement* compilé dans `native_engine/target/release`
+(le moteur alpha-bêta de production réel, canonicalisation comprise) dans
+le dossier de sortie de la campagne, avec un manifeste sha256 — exactement
+le motif `freeze` de `tools/hermes_canonicalisation_campaign.py`, appliqué
+ici au côté référence plutôt qu'au côté candidat. Sans ça, une recompilation
+en cours de campagne (même sans rapport avec ce script) changerait
+silencieusement ce que « la référence » désigne pour les parties déjà
+jouées. L'archive historique `experiments/references/b698745` que
+`verify_reference` vérifie est une vérification de provenance différente et
+sans rapport : cette archive précède les travaux de génération progressive
+et de canonisation déjà fusionnés dans `main`, ce n'est donc pas le moteur
+de production actuel — elle n'est jamais chargée pour la recherche.
 """
 from __future__ import annotations
 
@@ -22,7 +36,9 @@ import argparse
 import ctypes as C
 import hashlib
 import json
+import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +67,42 @@ def verify_reference():
         if digest(REFERENCE / name) != meta[key]:
             raise ValueError(f'Reference integrity mismatch: {name}')
     return meta
+
+
+def freeze_reference(directory):
+    """Snapshot the engine currently built at `native.library_path()` (today's
+    live `native_engine/target/release` build, i.e. the actual production
+    alpha-beta engine, canonicalisation work included) as the reference under
+    test for this run, so a rebuild mid-campaign -- even one triggered by
+    something unrelated to this script -- can never silently change what
+    'the reference' means partway through. Deliberately NOT the historical
+    `experiments/references/b698745` snapshot `verify_reference` checks above:
+    that archive predates the progressive-generation + canonicalisation work
+    already merged into main, so it is not today's production engine; it is
+    kept here only as an unrelated provenance check on a different archive.
+    Structurally the same as `tools/hermes_canonicalisation_campaign.py::freeze`
+    (copy the live `.so` into the campaign directory + sha256 manifest; skip
+    the copy if the manifest already exists so re-running the same `--out`
+    directory never silently re-snapshots)."""
+    target = directory / 'reference'
+    target.mkdir(exist_ok=True)
+    original = native.library_path()
+    binary = target / Path(original).name
+    manifest = target / 'manifest.json'
+    if not manifest.exists():
+        shutil.copy2(original, binary)
+        atomic_json(manifest, {'engine_sha256': digest(binary)})
+    frozen = json.loads(manifest.read_text())
+    if digest(binary) != frozen['engine_sha256']:
+        raise ValueError('Reference snapshot integrity mismatch')
+    return binary, frozen
+
+
+def set_engine(lib):
+    if os.environ.get('SANTONI_ENGINE_LIB') != str(lib):
+        os.environ['SANTONI_ENGINE_LIB'] = str(lib)
+        native._library = None
+    native.library()
 
 
 def atomic_json(path, value):
@@ -101,14 +153,19 @@ def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
     return turn, time.monotonic() - started
 
 
-def reference_move(position, seconds):
+def reference_move(position, seconds, reference_binary):
+    # Route through the frozen snapshot, not whatever happens to be built at
+    # native.library_path() right now -- mirrors how the candidate side is
+    # already pinned to a specific worker binary rather than "whatever's
+    # currently built".
+    set_engine(reference_binary)
     analysis = native_search(position, seconds)
     if analysis.turn is None:
         raise ValueError('Reference engine returned no legal turn')
     return analysis.turn, analysis.elapsed
 
 
-def play(job, directory, seconds, checkpoint, socket_path, scratch_dir):
+def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, reference_binary):
     initial = job['initial']
     path = Path(directory) / f"game-{job['number']:04d}.json"
     position = validate_setup(initial['workers'], initial['powers'], initial['first'])
@@ -120,7 +177,7 @@ def play(job, directory, seconds, checkpoint, socket_path, scratch_dir):
             if is_candidate:
                 turn, elapsed = candidate_move(position, seconds, checkpoint, socket_path, scratch_dir)
             else:
-                turn, elapsed = reference_move(position, seconds)
+                turn, elapsed = reference_move(position, seconds, reference_binary)
             data['decisions'].append({'ply': ply + 1, 'player': position.player,
                                        'backend': 'candidate' if is_candidate else 'reference',
                                        'elapsed': elapsed})
@@ -185,17 +242,20 @@ def main():
                               'same convention as tools/hermes_canonicalisation_campaign.py --limit.')
     args = parser.parse_args()
     verify_reference()
+    directory = Path(args.out)
+    directory.mkdir(parents=True, exist_ok=True)
+    reference_binary, reference_manifest = freeze_reference(directory)
+    print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
     corpus = json.loads(CORPUS.read_text())
     jobs_all = corpus['jobs']
     jobs = [{'number': i + 1, 'variant_player': player, 'initial': job}
             for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
     if args.limit:
         jobs = jobs[:args.limit]
-    directory = Path(args.out)
-    directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as scratch:
         scratch_dir = Path(scratch)
-        results = [play(job, directory, args.seconds, args.checkpoint, args.inference_socket, scratch_dir)
+        results = [play(job, directory, args.seconds, args.checkpoint, args.inference_socket, scratch_dir,
+                         reference_binary)
                    for job in jobs]
     result = summary(directory, corpus)
     report(directory, result)
