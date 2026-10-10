@@ -43,8 +43,21 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -
     let mut state = initial_state();
     let mut moves = Vec::new();
     loop {
-        if let Some(v) = terminal_value(&state, 0) {
-            return GameRecord { moves, outcome: v as i8 };
+        // `terminal_value(&state, 0)` (the plan brief's literal check) misses
+        // the case where player 1 is the one with no legal move: its
+        // stuck-player branch only fires when `to_move == s.player`, so with
+        // a hardcoded `0` it never fires while `s.player == 1`. The position
+        // is then silently treated as non-terminal, `Mcts::new`/`Mcts::run`
+        // gets called on an already-terminal root, and `Mcts::run`'s own
+        // assertion panics — aborting the whole worker and losing every
+        // remaining game in the batch. Checking from `state.player`'s own
+        // perspective makes both branches (win and stuck) fire correctly in
+        // all cases, then flipping the sign when `state.player == 1`
+        // converts the result to the fixed player-0 perspective that
+        // `GameRecord.outcome` carries throughout the rest of this function.
+        if let Some(v) = terminal_value(&state, state.player) {
+            let outcome = if state.player == 0 { v } else { -v };
+            return GameRecord { moves, outcome: outcome as i8 };
         }
         let mut mcts = Mcts::new(state, 1.5);
         mcts.run(simulations_per_move, evaluator);

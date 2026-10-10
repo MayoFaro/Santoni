@@ -268,6 +268,42 @@ mod tests {
         mcts_after.sort_by_key(|s| format!("{:?}", s));
         assert_eq!(after_states, mcts_after);
     }
+
+    /// Couverture dédiée (jusqu'ici seulement incidente via le smoke test
+    /// Python) du cas à une seule action de `legal_children` : un
+    /// déplacement qui monte à hauteur 3 gagne immédiatement
+    /// (`Generator::builds` dans lib.rs clôt le tour sans construction),
+    /// et `legal_children` doit synthétiser une construction factice
+    /// ciblant la case d'arrivée plutôt que paniquer sur l'assertion de
+    /// longueur de tour.
+    ///
+    /// Utilise `State::default()` (défini plus haut dans ce fichier) plutôt
+    /// que le `base_state()` ci-dessus construit par `mem::zeroed()` :
+    /// celui-ci laisse `adonis`/`extra`/`resume` à zéro, ce qui fait
+    /// basculer `generate` sur le chemin `advanced::generate` et — piège
+    /// déjà documenté sur `mcts_tree_tests::default_state` — génère alors
+    /// les coups des bâtisseurs du mauvais joueur (vérifié empiriquement :
+    /// avec `base_state()`, ce test ne trouvait aucun coup gagnant 0→1, le
+    /// générateur n'énumérant que les coups des bâtisseurs 20/24 bien que
+    /// `s.player == 0`).
+    #[test]
+    fn legal_children_synthesizes_a_placeholder_build_for_winning_moves() {
+        let mut s = State {
+            workers: [[0, 4, -1, -1], [20, 24, -1, -1]],
+            ..Default::default()
+        };
+        s.heights[0] = 2;
+        s.heights[1] = 3; // adjacente à la case 0, non dômée : coup gagnant pour le bâtisseur 0
+        let children = legal_children(&s);
+        let found = children
+            .iter()
+            .find(|(mv, _, _)| mv.source == 0 && mv.target == 1)
+            .expect("le coup gagnant 0->1 doit apparaître parmi les coups légaux");
+        let (mv, bld, after) = found;
+        assert_eq!(after.winner, 0, "monter à hauteur 3 doit déclarer le joueur au trait vainqueur");
+        assert_eq!(bld.target, mv.target, "la construction factice cible la case d'arrivée du déplacement");
+        assert_eq!(bld.source, mv.target);
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +365,37 @@ mod mcts_tree_tests {
         s.domes = !0u32 & !((1 << 12) | (1 << 13));
         s.player = 0;
         assert_eq!(terminal_value(&s, 0), Some(-1));
+    }
+
+    /// Pin de la régression trouvée en revue sur `selfplay_worker.rs` : le
+    /// brief du plan appelait `terminal_value(&state, 0)` en dur dans la
+    /// boucle de `play_one_game`. La branche « joueur bloqué » de
+    /// `terminal_value` ne se déclenche que si `to_move == s.player` ; avec
+    /// un `0` codé en dur, elle ne se déclenche jamais quand c'est le
+    /// joueur 1 qui est bloqué (`s.player == 1 != 0`), et la position
+    /// terminale est manquée (`None` au lieu de `Some(-1)`). C'est ce même
+    /// scénario que `terminal_value_reports_loss_for_player_with_no_legal_move`
+    /// ci-dessus, mais avec les rôles inversés (joueur 1 bloqué plutôt que
+    /// joueur 0) pour isoler précisément le biais de perspective corrigé
+    /// par `terminal_value(&state, state.player)` dans
+    /// `bin/selfplay_worker.rs`.
+    #[test]
+    fn terminal_value_reports_loss_for_player_one_stuck_even_though_hardcoded_zero_misses_it() {
+        let mut s = default_state();
+        // Bâtisseurs du joueur au trait (joueur 1) complètement enfermés
+        // par des dômes ; le joueur 0 reste libre.
+        s.workers = [[0, 1, -1, -1], [12, 13, -1, -1]];
+        s.domes = !0u32 & !((1 << 12) | (1 << 13));
+        s.player = 1;
+        assert_eq!(
+            terminal_value(&s, 0),
+            None,
+            "le `0` codé en dur de l'ancienne version de play_one_game manque bien cette position terminale"
+        );
+        assert_eq!(
+            terminal_value(&s, s.player),
+            Some(-1),
+            "interroger depuis la perspective du joueur au trait détecte correctement le blocage"
+        );
     }
 }
