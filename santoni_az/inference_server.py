@@ -21,6 +21,17 @@ class InferenceServer:
         # active exception", SIGABRT, intermittently ~1 run in 3). Batching
         # already gets the parallelism we need across requests, so losing
         # intra-op CPU parallelism here costs little.
+        #
+        # IMPORTANT: torch.set_num_threads() is PROCESS-WIDE, not scoped to
+        # this InferenceServer instance -- PyTorch has no per-instance
+        # thread pool. Constructing any InferenceServer silently downgrades
+        # ALL torch code running in the same process (e.g. Task 10's
+        # Trainer, if it shares a process with this server) to
+        # single-threaded intra-op execution. This is a deliberate,
+        # necessary tradeoff to avoid the SIGABRT above, not an oversight;
+        # a caller that also needs multi-threaded torch CPU ops elsewhere
+        # in the same process should run this server in a separate process
+        # instead.
         torch.set_num_threads(1)
         self.socket_path = socket_path
         self.net = net
@@ -45,7 +56,20 @@ class InferenceServer:
         # into torch, and leaving it alive-but-unjoined when the process
         # proceeds to interpreter shutdown races with native OpenMP/CUDA
         # thread-pool teardown and can abort the process (see note in
-        # __init__). Bounded wait so stop() can't hang forever.
+        # __init__).
+        #
+        # NOTE for callers (e.g. Task 10's orchestrator): this join has a
+        # BOUNDED timeout, so it is a best-effort wait, not a hard
+        # guarantee that the flush thread has fully exited by the time
+        # stop() returns. An unconditional (untimed) join was rejected
+        # deliberately: if a forward pass + sendall were ever stuck (slow
+        # client, GPU hang, etc.), an untimed join would hang the entire
+        # orchestrator's shutdown forever, which is worse than the already
+        # unlikely SIGABRT this join mostly eliminates. If a forward pass
+        # legitimately takes longer than the timeout below, stop() will
+        # return while that thread is still running and still touching
+        # torch -- the original race, just much less likely to be hit in
+        # practice.
         flusher = self._flusher_thread
         if flusher is not None:
             flusher.join(timeout=max(self.flush_interval_s * 10, 1.0))
@@ -77,31 +101,51 @@ class InferenceServer:
                 return
             self._pending.append((planes_list, conn))
 
+    def _drain_and_process_once(self):
+        """Take whatever is currently in `_pending`, run one forward pass
+        over it if non-empty, and respond to each waiting client. Shared
+        by the periodic loop below and by the unconditional final pass in
+        `_flush_loop`, so both go through the exact same batching logic."""
+        with self._lock:
+            batch, self._pending = self._pending, []
+        if not batch:
+            return
+        all_planes = [p for planes_list, _ in batch for p in planes_list]
+        tensor = torch.stack([
+            torch.frombuffer(bytearray(p), dtype=torch.uint8).reshape(6, 5, 5).float()
+            for p in all_planes
+        ])
+        with torch.no_grad():
+            policy_logits, values = self.net(tensor)
+        policies = policy_logits.tolist()
+        values = [v[0] for v in values.tolist()]
+        offset = 0
+        for planes_list, conn in batch:
+            n = len(planes_list)
+            response = pack_response(policies[offset:offset + n], values[offset:offset + n])
+            try:
+                conn.sendall(response)
+            finally:
+                conn.close()
+            offset += n
+
     def _flush_loop(self):
         while self._running:
             time.sleep(self.flush_interval_s)
-            with self._lock:
-                batch, self._pending = self._pending, []
-            if not batch:
-                continue
-            all_planes = [p for planes_list, _ in batch for p in planes_list]
-            tensor = torch.stack([
-                torch.frombuffer(bytearray(p), dtype=torch.uint8).reshape(6, 5, 5).float()
-                for p in all_planes
-            ])
-            with torch.no_grad():
-                policy_logits, values = self.net(tensor)
-            policies = policy_logits.tolist()
-            values = [v[0] for v in values.tolist()]
-            offset = 0
-            for planes_list, conn in batch:
-                n = len(planes_list)
-                response = pack_response(policies[offset:offset + n], values[offset:offset + n])
-                try:
-                    conn.sendall(response)
-                finally:
-                    conn.close()
-                offset += n
+            self._drain_and_process_once()
+        # The while condition above is checked BEFORE each sleep, so the
+        # loop's last iteration already drains whatever had accumulated
+        # during that final sleep -- but there is still a narrow window
+        # between that last drain (the `with self._lock: batch, ... = ...`
+        # swap) and this loop re-checking `self._running` and exiting:
+        # a request appended to `_pending` in exactly that window would
+        # otherwise sit there forever with no one left to flush it,
+        # stranding its client on recv(). One more unconditional drain
+        # right before this thread exits closes that window. (A client
+        # that connects only after stop() has fully returned is a
+        # different, caller-ordering concern -- the listener socket is
+        # already closed by then -- and is out of scope here.)
+        self._drain_and_process_once()
 
     def serve_forever(self):
         self._flusher_thread = threading.Thread(target=self._flush_loop, daemon=True)
