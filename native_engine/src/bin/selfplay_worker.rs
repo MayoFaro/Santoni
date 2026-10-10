@@ -8,11 +8,12 @@
 //! via une déclaration `extern "C"` manuelle plutôt qu'une crate comme `ctrlc`.
 use santoni_engine::mcts::{legal_children, terminal_value, Mcts, LeafEvaluator, ACTION_SPACE};
 use santoni_engine::mcts_io::{write_game_atomically, GameRecord};
-use santoni_engine::State;
+use santoni_engine::{Action, State};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 struct UniformEvaluator;
 impl LeafEvaluator for UniformEvaluator {
@@ -182,8 +183,70 @@ fn install_sigint_handler() {
     }
 }
 
+/// Mode « un seul coup » : arbitre une position isolée quelconque du
+/// sous-jeu sans pouvoir (fournie par une campagne Python, Task 12) plutôt
+/// que de jouer des parties complètes depuis l'ouverture comme le mode
+/// self-play continu ci-dessous. Lit `size_of::<State>()` octets bruts
+/// depuis `input_state` — mêmes octets que ceux produits par
+/// `santorini.native.encode(position)` côté Python, puisque `State`/
+/// `Action` (lib.rs) et `CState`/`CAction` (santorini/native.py) décrivent
+/// la même disposition mémoire `#[repr(C)]`, déjà garantie identique par
+/// `santoni_state_size()` (vérifié par `native.py::library()` à chaque
+/// chargement de la bibliothèque) — puis écrit `size_of::<Action>() * 2`
+/// octets (déplacement puis construction) dans `output_move`, dans le même
+/// ordre que celui attendu par `CAction.from_buffer_copy` côté Python.
+///
+/// `is_in_scope` rejette (via `assert!`) toute position hors du sous-jeu
+/// sans pouvoir, exactement comme `legal_children`/`terminal_value` dans
+/// `mcts.rs` : ce mode ne sait arbitrer que les positions que `Mcts` sait
+/// déjà traiter, pas question de deviner un comportement sur le reste du
+/// moteur.
+fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, evaluator: &mut dyn LeafEvaluator) {
+    let bytes = std::fs::read(input_state).expect("lecture de l'état d'entrée impossible");
+    assert_eq!(bytes.len(), std::mem::size_of::<State>(), "taille d'état incompatible");
+    let state: State = unsafe { std::ptr::read(bytes.as_ptr() as *const State) };
+    assert!(santoni_engine::mcts::is_in_scope(&state), "position hors périmètre sans-pouvoir");
+
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut mcts = Mcts::new(state, 1.5);
+    const BATCH: u32 = 16;
+    loop {
+        mcts.run(BATCH, evaluator);
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    let counts = mcts.visit_counts();
+    let legal = legal_children(&state);
+    let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
+    let (mv, bld, _) = legal[best];
+
+    let mut out = Vec::with_capacity(std::mem::size_of::<Action>() * 2);
+    out.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(&mv as *const Action as *const u8, std::mem::size_of::<Action>())
+    });
+    out.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(&bld as *const Action as *const u8, std::mem::size_of::<Action>())
+    });
+    let tmp = output_move.with_extension("bin.tmp");
+    std::fs::write(&tmp, &out).expect("écriture du coup impossible");
+    std::fs::rename(&tmp, output_move).expect("renommage du coup impossible");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--single-move") {
+        let input_state = PathBuf::from(parse_arg(&args, "--input-state"));
+        let output_move = PathBuf::from(parse_arg(&args, "--output-move"));
+        let seconds: f64 = parse_arg(&args, "--seconds").parse().unwrap();
+        let socket_path = args.iter().position(|a| a == "--inference-socket").map(|i| args[i + 1].clone());
+        let mut evaluator: Box<dyn LeafEvaluator> = match socket_path {
+            Some(path) => Box::new(SocketEvaluator::connect(&path)),
+            None => Box::new(UniformEvaluator),
+        };
+        run_single_move(&input_state, &output_move, seconds, evaluator.as_mut());
+        return;
+    }
     let games: u32 = parse_arg(&args, "--games").parse().unwrap();
     let out_dir = PathBuf::from(parse_arg(&args, "--out-dir"));
     let simulations_per_move: u32 = parse_arg(&args, "--simulations-per-move").parse().unwrap();
