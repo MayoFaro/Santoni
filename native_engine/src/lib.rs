@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 mod advanced;
 mod special;
 pub mod mcts;
+pub mod mcts_io;
 
 const MATE: i32 = 100_000;
 const MAX_ACTIONS: usize = 128;
