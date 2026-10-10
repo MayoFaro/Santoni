@@ -157,17 +157,47 @@ impl Mcts {
             terminal_value(&self.root, self.root.player).is_none(),
             "Mcts::run appelé sur une racine déjà terminale"
         );
-        // Expansion initiale de la racine : ne compte pas comme une des
-        // `simulations`. Sans elle, la toute première itération ne ferait
-        // qu'évaluer et peupler les arêtes de la racine sans jamais
-        // descendre ni backuper sur l'une d'elles (aucun parent au-dessus de
-        // la racine pour recevoir ce backup) — `visit_counts` totaliserait
-        // alors `simulations - 1`.
+        self.ensure_root_expanded(evaluator);
+        for _ in 0..simulations {
+            self.simulate_one(self.root, evaluator);
+        }
+    }
+
+    /// Expansion initiale de la racine (évaluation + peuplement des arêtes),
+    /// idempotente : ne fait rien si déjà expansée. Ne compte pas comme une
+    /// des simulations de `run` — sans elle, la toute première itération ne
+    /// ferait qu'évaluer et peupler les arêtes de la racine sans jamais
+    /// descendre ni backuper sur l'une d'elles (aucun parent au-dessus de la
+    /// racine pour recevoir ce backup) — `visit_counts` totaliserait alors
+    /// `simulations - 1`. Extraite de `run` (plutôt qu'inlinée comme avant)
+    /// pour que l'appelant self-play puisse injecter du bruit de Dirichlet
+    /// (`mix_root_noise`) entre l'expansion et le reste des simulations ;
+    /// l'appeler directement est un no-op si `run` l'a déjà fait.
+    pub fn ensure_root_expanded(&mut self, evaluator: &mut dyn LeafEvaluator) {
         if !self.nodes.contains_key(&self.root) {
             self.simulate_one(self.root, evaluator);
         }
-        for _ in 0..simulations {
-            self.simulate_one(self.root, evaluator);
+    }
+
+    /// Mélange du bruit de Dirichlet dans les priors des arêtes de la
+    /// racine — exploration en self-play uniquement, jamais sur le chemin
+    /// d'arbitrage (`run_single_move` dans `bin/selfplay_worker.rs`), qui
+    /// doit rester le jeu le plus fort possible. Doit être appelée après
+    /// `ensure_root_expanded` (les arêtes doivent déjà exister) et avant le
+    /// reste des simulations de `run`, sinon le bruit n'affecte jamais la
+    /// sélection UCB.
+    pub fn mix_root_noise(&mut self, noise: &[f32], epsilon: f32) {
+        let node = self
+            .nodes
+            .get_mut(&self.root)
+            .expect("mix_root_noise appelé avant l'expansion de la racine (cf. ensure_root_expanded)");
+        assert_eq!(
+            node.edges.len(),
+            noise.len(),
+            "le bruit doit avoir une valeur par coup légal à la racine"
+        );
+        for (edge, &n) in node.edges.iter_mut().zip(noise) {
+            edge.prior = edge.prior * (1.0 - epsilon) + n * epsilon;
         }
     }
 
@@ -397,5 +427,38 @@ mod mcts_tree_tests {
             Some(-1),
             "interroger depuis la perspective du joueur au trait détecte correctement le blocage"
         );
+    }
+
+    #[test]
+    fn mix_root_noise_biases_simulations_toward_the_noised_edge() {
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = UniformEvaluator;
+        mcts.ensure_root_expanded(&mut eval);
+        let n_edges = mcts.visit_counts().len();
+        assert!(n_edges > 1, "fixture doit offrir plusieurs coups légaux pour que le test ait un sens");
+        let mut noise = vec![0.0f32; n_edges];
+        noise[0] = 1.0;
+        mcts.mix_root_noise(&noise, 1.0);
+        mcts.run(200, &mut eval);
+        let counts = mcts.visit_counts();
+        let noised_visits = counts[0].2;
+        assert!(
+            counts.iter().all(|(_, _, n)| *n <= noised_visits),
+            "l'arête bruitée doit recevoir au moins autant de visites que les autres"
+        );
+        assert!(
+            noised_visits > 200 / n_edges as u32,
+            "l'arête bruitée doit recevoir nettement plus que sa part uniforme"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mix_root_noise appelé avant l'expansion de la racine")]
+    fn mix_root_noise_panics_before_root_expansion() {
+        let s = default_state();
+        let mut mcts = Mcts::new(s, 1.5);
+        mcts.mix_root_noise(&[1.0], 0.25);
     }
 }
