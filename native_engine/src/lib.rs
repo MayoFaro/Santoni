@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 mod advanced;
 mod special;
+pub mod mcts;
 
 const MATE: i32 = 100_000;
 const MAX_ACTIONS: usize = 128;
