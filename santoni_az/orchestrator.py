@@ -10,6 +10,18 @@ from .trainer import Trainer
 ROOT = Path(__file__).resolve().parents[1]
 WORKER_BINARY = ROOT / "native_engine" / "target" / "release" / "selfplay_worker"
 
+# Intervalle minimal entre deux checkpoints (secondes de temps mural).
+# La boucle d'entraînement tourne à 0,5 s par itération ; sauvegarder à
+# chaque itération écrivait un checkpoint de plusieurs mégaoctets ~1,5 fois
+# par seconde (mesure de la revue finale), le plus souvent quasi identique au
+# précédent et très souvent sans qu'aucun pas de gradient n'ait eu lieu entre
+# les deux. 5 s découple la cadence de sauvegarde de la cadence de scrutation
+# sans allonger significativement la perte maximale en cas d'arrêt brutal :
+# ce qui est en jeu, ce sont au pire les quelques pas de gradient des 5
+# dernières secondes, jamais les parties terminées (écrites atomiquement par
+# les workers, et réintégrées au prochain `consume_new_games`).
+MIN_CHECKPOINT_INTERVAL_S = 5.0
+
 
 class Orchestrator:
     def __init__(self, run_dir, worker_count=1):
@@ -44,6 +56,10 @@ class Orchestrator:
         self._workers = []
         self._train_thread = None
         self._running = False
+        # Horodatage (temps monotone) de la dernière sauvegarde de
+        # checkpoint ; `None` = aucune encore faite dans ce processus. Lu et
+        # écrit uniquement par `_train_loop`.
+        self._last_save = None
         # Guards reads of self.trainer.generation / self._workers against
         # the background _train_loop thread so status() never observes a
         # torn mid-mutation state (e.g. Trainer.save_checkpoint()
@@ -67,11 +83,40 @@ class Orchestrator:
         self._train_thread.start()
 
     def _train_loop(self):
+        """Boucle d'entraînement : consomme les parties, fait un pas de
+        gradient, et ne sauvegarde que si quelque chose a réellement changé.
+
+        Deux conditions, toutes deux nécessaires, pour appeler
+        `save_checkpoint()` :
+
+        1. `train_step()` a réellement entraîné. `Trainer.train_step` renvoie
+           exactement `0.0` quand sa file d'exemples est vide (il sort avant
+           tout calcul) ; dans tous les autres cas il renvoie la perte
+           calculée. Une perte strictement nulle sur un vrai pas de gradient
+           est numériquement hors d'atteinte ici (somme d'une entropie
+           croisée sur 1250 classes et d'une MSE), donc `loss != 0.0` est un
+           signal fiable de « un pas a eu lieu ». Sans cette condition, la
+           boucle incrémentait le compteur de génération et écrivait un
+           checkpoint identique au précédent même quand aucun worker n'avait
+           encore livré la moindre partie.
+        2. Au moins `MIN_CHECKPOINT_INTERVAL_S` depuis la dernière
+           sauvegarde, pour découpler la cadence d'écriture de l'intervalle
+           de scrutation de 0,5 s de cette boucle.
+
+        La toute première sauvegarde après un pas de gradient n'est pas
+        retardée (`self._last_save is None`), pour qu'un démarrage publie un
+        checkpoint dès qu'il a quelque chose à publier.
+        """
         while self._running:
             self.trainer.consume_new_games()
-            self.trainer.train_step()
-            with self._status_lock:
-                self.trainer.save_checkpoint()
+            loss = self.trainer.train_step()
+            trained = loss != 0.0
+            now = time.monotonic()
+            due = self._last_save is None or now - self._last_save >= MIN_CHECKPOINT_INTERVAL_S
+            if trained and due:
+                with self._status_lock:
+                    self.trainer.save_checkpoint()
+                self._last_save = now
             time.sleep(0.5)
 
     def stop(self):
