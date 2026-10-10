@@ -7,7 +7,7 @@
 //! l'arrêt propre sur SIGINT appelle directement `signal(2, ...)` de la libc
 //! via une déclaration `extern "C"` manuelle plutôt qu'une crate comme `ctrlc`.
 use santoni_engine::mcts::{legal_children, terminal_value, Mcts, LeafEvaluator, ACTION_SPACE};
-use santoni_engine::mcts_io::{write_game_atomically, GameRecord};
+use santoni_engine::mcts_io::{write_game_atomically, GameRecord, PositionRecord};
 use santoni_engine::{Action, State};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -115,7 +115,7 @@ fn initial_state() -> State {
 
 fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -> GameRecord {
     let mut state = initial_state();
-    let mut moves = Vec::new();
+    let mut positions = Vec::new();
     loop {
         // `terminal_value(&state, 0)` (the plan brief's literal check) misses
         // the case where player 1 is the one with no legal move: its
@@ -131,22 +131,26 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator) -
         // `GameRecord.outcome` carries throughout the rest of this function.
         if let Some(v) = terminal_value(&state, state.player) {
             let outcome = if state.player == 0 { v } else { -v };
-            return GameRecord { moves, outcome: outcome as i8 };
+            return GameRecord { positions, outcome: outcome as i8 };
         }
+        let planes = santoni_engine::mcts::encode_planes(&state);
         let mut mcts = Mcts::new(state, 1.5);
         mcts.run(simulations_per_move, evaluator);
         let counts = mcts.visit_counts();
-        let total: u32 = counts.iter().map(|(_, _, n)| n).sum();
-        let (mv, bld, after) = {
-            let legal = legal_children(&state);
-            let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
-            legal[best].clone()
-        };
-        let worker_slot = state.workers[state.player as usize]
+        let legal = legal_children(&state);
+        let visits: Vec<(usize, u32)> = counts
             .iter()
-            .position(|&c| c == mv.source)
-            .unwrap();
-        moves.push((santoni_engine::mcts::action_index(&mv, &bld, worker_slot), total));
+            .map(|(mv, bld, n)| {
+                let worker_slot = state.workers[state.player as usize]
+                    .iter()
+                    .position(|&c| c == mv.source)
+                    .unwrap();
+                (santoni_engine::mcts::action_index(mv, bld, worker_slot), *n)
+            })
+            .collect();
+        let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
+        let (_, _, after) = legal[best];
+        positions.push(PositionRecord { planes, visits });
         state = after;
     }
 }
