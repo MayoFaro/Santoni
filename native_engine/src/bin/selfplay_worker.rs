@@ -192,9 +192,21 @@ fn install_sigint_handler() {
 /// `Action` (lib.rs) et `CState`/`CAction` (santorini/native.py) décrivent
 /// la même disposition mémoire `#[repr(C)]`, déjà garantie identique par
 /// `santoni_state_size()` (vérifié par `native.py::library()` à chaque
-/// chargement de la bibliothèque) — puis écrit `size_of::<Action>() * 2`
-/// octets (déplacement puis construction) dans `output_move`, dans le même
-/// ordre que celui attendu par `CAction.from_buffer_copy` côté Python.
+/// chargement de la bibliothèque).
+///
+/// Format de sortie : un `u32` petit-boutiste (nombre d'actions du tour),
+/// puis ce nombre d'`Action` brutes, dans le même ordre que celui attendu
+/// par `CAction.from_buffer_copy` côté Python. Le préfixe est indispensable
+/// parce qu'un tour n'a **pas** toujours deux actions : monter sur une case
+/// de hauteur 3 gagne la partie immédiatement, le générateur clôt alors le
+/// tour sans construction (`t.actions.len() == 1`, cf. le commentaire de
+/// `mcts::legal_children`). `legal_children` synthétise une construction
+/// factice pour garder une forme fixe en interne, mais l'écrire ici ferait
+/// rejeter par `validate_turn` (côté Python) chaque tour gagnant : la
+/// correspondance avec le vrai tour légal doit être exacte. Le préfixe
+/// `u32` LE est le même encodage de compteur que le protocole d'inférence
+/// (`santoni_az/inference_protocol.py::pack_request`), donc symétrique à
+/// lire avec `struct.unpack('<I', ...)`.
 ///
 /// `is_in_scope` rejette (via `assert!`) toute position hors du sous-jeu
 /// sans pouvoir, exactement comme `legal_children`/`terminal_value` dans
@@ -204,7 +216,14 @@ fn install_sigint_handler() {
 fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, evaluator: &mut dyn LeafEvaluator) {
     let bytes = std::fs::read(input_state).expect("lecture de l'état d'entrée impossible");
     assert_eq!(bytes.len(), std::mem::size_of::<State>(), "taille d'état incompatible");
-    let state: State = unsafe { std::ptr::read(bytes.as_ptr() as *const State) };
+    // `read_unaligned` et non `read` : `bytes` est un `Vec<u8>` issu de
+    // `std::fs::read`, dont l'allocation n'offre aucune garantie
+    // d'alignement pour un `State` (align_of::<State>() > 1). En pratique
+    // l'allocateur sur-aligne presque toujours, mais une lecture alignée
+    // sur un pointeur non garanti aligné est un comportement indéfini —
+    // `read_unaligned` est correct par construction et de coût identique
+    // ici (une seule lecture par processus).
+    let state: State = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const State) };
     assert!(santoni_engine::mcts::is_in_scope(&state), "position hors périmètre sans-pouvoir");
 
     let deadline = Instant::now() + Duration::from_secs_f64(seconds);
@@ -219,15 +238,33 @@ fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, e
     let counts = mcts.visit_counts();
     let legal = legal_children(&state);
     let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
-    let (mv, bld, _) = legal[best];
+    let (mv, bld, after) = legal[best];
 
-    let mut out = Vec::with_capacity(std::mem::size_of::<Action>() * 2);
-    out.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(&mv as *const Action as *const u8, std::mem::size_of::<Action>())
-    });
-    out.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(&bld as *const Action as *const u8, std::mem::size_of::<Action>())
-    });
+    // Un tour gagnant n'a qu'une action. Dans le sous-jeu sans pouvoir,
+    // `apply` (lib.rs) ne positionne `winner` que sur un déplacement montant
+    // à hauteur 3 — la seconde cause possible (descente de Pan) exige
+    // `powers[p] == 9`, exclu par `is_in_scope` ci-dessus. Donc
+    // `after.winner >= 0` est exactement équivalent à « le tour légal réel
+    // n'avait qu'une action », et la construction portée par
+    // `legal_children` dans ce cas est la factice qu'il synthétise.
+    // L'assertion le vérifie plutôt que de le supposer : si la convention de
+    // `mcts::legal_children` changeait, on échouerait bruyamment ici au lieu
+    // d'écrire silencieusement un tour que `validate_turn` rejetterait.
+    let winning = after.winner >= 0;
+    if winning {
+        assert!(
+            bld.source == mv.target && bld.target == mv.target,
+            "tour gagnant sans construction factice : convention de legal_children modifiée"
+        );
+    }
+    let actions: &[Action] = if winning { &[mv] } else { &[mv, bld] };
+
+    let mut out = (actions.len() as u32).to_le_bytes().to_vec();
+    for action in actions {
+        out.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(action as *const Action as *const u8, std::mem::size_of::<Action>())
+        });
+    }
     let tmp = output_move.with_extension("bin.tmp");
     std::fs::write(&tmp, &out).expect("écriture du coup impossible");
     std::fs::rename(&tmp, output_move).expect("renommage du coup impossible");

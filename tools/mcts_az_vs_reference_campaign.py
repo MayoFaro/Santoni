@@ -5,16 +5,32 @@ méthode de bootstrap par groupe de placement que
 `verify_reference`, `atomic_json`, `bootstrap` de ce script (voir ses lignes
 45-61 et 213-221 pour la provenance).
 
-Décodage des actions : le worker (`--single-move`, Task 11) renvoie deux
-`CAction` bruts (déplacement puis deuxième action). Le `kind` de la deuxième
-action n'est pas toujours « build » (1) — sur une position de milieu/fin de
-partie quelconque du corpus, un tour gagnant peut se terminer par un dôme
-(`kind == 2`) plutôt qu'une construction. On décode donc le `kind` des deux
-actions via `ACTION_KINDS`, exactement comme `santorini.native.decode_turn`,
-au lieu de supposer `"move"`/`"build"` en dur (risque signalé par la revue de
-la Task 11, qui ne l'avait pas détecté : son propre test ne couvre que la
-position de départ fixe, où un tour gagnant en un coup ne peut jamais se
-clore par un dôme).
+Corpus : `experiments/no-power-corpus-20261010/campaign.json`, produit par
+`tools/generate_no_power_corpus.py` (graine 20261010). Volontairement **pas**
+le corpus historique `experiments/selfplay-100-5s-20261005/campaign.json` des
+campagnes précédentes : celui-ci est à 88 % composé de jobs avec pouvoirs
+(12 de ses 100 jobs seulement ont `powers == [0, 0]`), alors que le mode
+`--single-move` du worker candidat `assert!(is_in_scope(&state))` et panique
+sur toute position hors du sous-jeu sans pouvoir — une campagne de 200
+parties sur ce corpus s'effondrait donc en parties `'error'` et l'IC
+bootstrap (conditionné à `len(finished) == 200`) n'était jamais calculé. Le
+nouveau corpus garde schéma, motif de variantes et granularité de groupe de
+placement identiques (25 ouvertures × 2 orientations × 2 premiers joueurs,
+groupes `(matchup, opening)` de 4 jobs), avec `powers == [0, 0]` partout.
+`main()` revérifie cet invariant job par job dès le chargement, pour qu'un
+corpus inadapté échoue en une seconde et non au bout de plusieurs heures.
+
+Décodage des actions : le worker (`--single-move`, Task 11) écrit un `u32`
+petit-boutiste donnant le nombre d'actions du tour, puis ce nombre de
+`CAction` bruts. Ce nombre vaut 1 ou 2 : monter sur une case de hauteur 3
+gagne immédiatement et le tour se clôt sans construction. Lire deux actions
+en dur (ce que faisait la première version) faisait rejeter par
+`validate_turn` — qui exige une correspondance exacte avec le tour légal
+réel — *tout* tour gagnant du candidat, transformant chaque victoire
+candidate en partie `'error'`. Le `kind` de chaque action est décodé via
+`ACTION_KINDS`, exactement comme `santorini.native.decode_turn`, au lieu de
+supposer `"move"`/`"build"` en dur : sur une position de milieu/fin de partie
+quelconque du corpus, la deuxième action peut être un dôme (`kind == 2`).
 
 Moteur de référence : le côté référence passe par `freeze_reference`, qui
 copie le `.so` *actuellement* compilé dans `native_engine/target/release`
@@ -39,6 +55,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,7 +65,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'experiments/references/b698745'
-CORPUS = ROOT / 'experiments/selfplay-100-5s-20261005/campaign.json'
+CORPUS = ROOT / 'experiments/no-power-corpus-20261010/campaign.json'
 WORKER_BINARY = ROOT / 'native_engine' / 'target' / 'release' / 'selfplay_worker'
 
 sys.path.insert(0, str(ROOT))
@@ -138,18 +155,24 @@ def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
     if result.returncode != 0:
         raise ValueError(f'Candidate worker failed: {result.stderr}')
     raw = output_path.read_bytes()
-    move_action = CAction.from_buffer_copy(raw, 0)
-    build_action = CAction.from_buffer_copy(raw, C.sizeof(CAction))
-    # Décodage générique du `kind` (voir santorini.native.decode_turn) : ne
-    # jamais supposer "move"/"build" en dur, la deuxième action peut être un
-    # dôme (kind 2) sur une position arbitraire du corpus.
-    actions = (
-        Action(ACTION_KINDS[move_action.kind], move_action.player, move_action.worker,
-               move_action.source, move_action.target),
-        Action(ACTION_KINDS[build_action.kind], build_action.player, build_action.worker,
-               build_action.source, build_action.target),
-    )
-    turn = validate_turn(position, actions)
+    # Préfixe `u32` LE = nombre d'actions réellement écrites (1 ou 2). Un tour
+    # gagnant (montée à hauteur 3) n'a qu'une action : le générateur clôt le
+    # tour sans construction. `validate_turn` exigeant la correspondance
+    # exacte avec le tour légal, en soumettre deux transformait chaque
+    # victoire du candidat en partie 'error'. Décodage générique du `kind`
+    # (voir santorini.native.decode_turn) : ne jamais supposer "move"/"build"
+    # en dur, la deuxième action peut être un dôme (kind 2) sur une position
+    # arbitraire du corpus.
+    (count,) = struct.unpack_from('<I', raw, 0)
+    expected = 4 + count * C.sizeof(CAction)
+    if count not in (1, 2) or len(raw) != expected:
+        raise ValueError(f'Candidate move file malformed: {len(raw)} bytes for {count} actions')
+    actions = []
+    for index in range(count):
+        item = CAction.from_buffer_copy(raw, 4 + index * C.sizeof(CAction))
+        actions.append(Action(ACTION_KINDS[item.kind], item.player, item.worker,
+                              item.source, item.target))
+    turn = validate_turn(position, tuple(actions))
     return turn, time.monotonic() - started
 
 
@@ -229,6 +252,30 @@ def report(directory, result):
     (directory / 'rapport.md').write_text('\n'.join(lines) + '\n')
 
 
+def check_corpus_is_no_power(jobs_all):
+    """Échoue immédiatement si le corpus chargé contient le moindre job avec
+    pouvoir.
+
+    Le candidat ne sait jouer que le sous-jeu sans pouvoir : `run_single_move`
+    (native_engine/src/bin/selfplay_worker.rs) `assert!(is_in_scope(&state))`
+    et panique sinon. Sans ce contrôle, un corpus inadapté — par exemple le
+    corpus historique `selfplay-100-5s-20261005`, à 88 % avec pouvoirs — ne se
+    manifeste que partie par partie, chacune marquée 'error' après avoir
+    dépensé son budget de temps : plusieurs heures de calcul pour un
+    `summary.json` sans IC bootstrap (celui-ci exige `len(finished) == 200`).
+    Mieux vaut échouer dans la première seconde."""
+    offenders = [job.get('number', index + 1) for index, job in enumerate(jobs_all)
+                 if list(job.get('powers', [])) != [0, 0]]
+    if offenders:
+        raise ValueError(
+            f'Corpus {CORPUS} is not a no-power corpus: {len(offenders)} of {len(jobs_all)} '
+            f'jobs have powers != [0, 0] (first offenders: {offenders[:10]}). The candidate '
+            'engine only plays the no-power subgame; regenerate a corpus with '
+            'tools/generate_no_power_corpus.py.')
+    if not jobs_all:
+        raise ValueError(f'Corpus {CORPUS} contains no job')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
@@ -248,6 +295,7 @@ def main():
     print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
     corpus = json.loads(CORPUS.read_text())
     jobs_all = corpus['jobs']
+    check_corpus_is_no_power(jobs_all)
     jobs = [{'number': i + 1, 'variant_player': player, 'initial': job}
             for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
     if args.limit:
