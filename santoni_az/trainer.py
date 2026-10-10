@@ -49,31 +49,23 @@ class Trainer:
         for f in new_files:
             data = json.loads(f.read_text())
             outcome = data["outcome"]
-            for action_idx, visits in data["moves"]:
+            for ply, position in enumerate(data["positions"]):
+                planes = torch.tensor(position["planes"], dtype=torch.float32).view(NUM_PLANES, 5, 5)
+                total_visits = sum(visits for _, visits in position["visits"])
                 policy_target = torch.zeros(ACTION_SPACE)
-                policy_target[action_idx] = 1.0  # cible simplifiée : un seul coup joué
-                # LIMITATION CONNUE, NON RÉSOLUE — placeholder, pas une
-                # entrée réelle : `torch.zeros(NUM_PLANES, 5, 5)` tient lieu
-                # d'état de plateau encodé. Le réseau reçoit donc exactement
-                # la même entrée constante pour *tous* les exemples, quelle
-                # que soit la position réellement jouée, et ne peut rien
-                # apprendre qui dépende de la position : il ne peut au mieux
-                # qu'ajuster un biais vers la distribution marginale des
-                # coups et des résultats. Toute mesure de force de jeu du
-                # candidat avant le remplacement de ce placeholder mesure un
-                # MCTS à priors quasi constants, pas un AlphaZero entraîné.
-                # Pour le lever il faut rejouer chaque partie depuis sa
-                # position de départ en appliquant les coups du
-                # `GameRecord` et encoder chaque position intermédiaire
-                # (`santoni_engine::mcts::encode_planes`, PLANE_BYTES=150 =
-                # 6 plans de 5x5) — le format de partie actuel ne stocke que
-                # `(action_index, total_visits)` par tour, ce qui suffit à
-                # cette reconstruction mais exige de l'implémenter.
-                # Deuxième limitation, du même ordre et distincte : la cible
-                # de politique one-hot ci-dessus (voir le commentaire de la
-                # Task 9 du plan) au lieu de la distribution des visites sur
-                # tous les coups légaux du tour.
-                self._examples.append((torch.zeros(NUM_PLANES, 5, 5), policy_target, float(outcome)))
+                for action_idx, visits in position["visits"]:
+                    policy_target[action_idx] = visits / total_visits
+                # Alternance stricte joueur 0 / joueur 1 à chaque ply : vraie
+                # pour toute la partie dans le sous-jeu sans pouvoir, où
+                # `is_in_scope` (native_engine/src/mcts.rs) impose
+                # `powers == [0, 0]` sur toute position rencontrée — aucun
+                # pouvoir ne peut donc jamais accorder de tour supplémentaire.
+                # `outcome` est fixé du point de vue du joueur 0 (cf.
+                # `play_one_game`) ; ce signe le reprojette depuis le point de
+                # vue du joueur réellement au trait à ce ply, celui encodé
+                # dans `position["planes"]`.
+                value_target = outcome if ply % 2 == 0 else -outcome
+                self._examples.append((planes, policy_target, float(value_target)))
             self._consumed_games.add(f.name)
         return len(new_files)
 
@@ -85,7 +77,7 @@ class Trainer:
         policy_targets = torch.stack([pt for _, pt, _ in batch])
         value_targets = torch.tensor([vt for _, _, vt in batch]).unsqueeze(1)
         policy_logits, value_pred = self.net(planes)
-        policy_loss = F.cross_entropy(policy_logits, policy_targets.argmax(dim=1))
+        policy_loss = F.cross_entropy(policy_logits, policy_targets)
         value_loss = F.mse_loss(value_pred, value_targets)
         loss = policy_loss + value_loss
         self.optimizer.zero_grad()
