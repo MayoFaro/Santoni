@@ -69,7 +69,7 @@ CORPUS = ROOT / 'experiments/no-power-corpus-20261010/campaign.json'
 WORKER_BINARY = ROOT / 'native_engine' / 'target' / 'release' / 'selfplay_worker'
 
 sys.path.insert(0, str(ROOT))
-from santorini.engine import Action, Position, validate_setup, validate_turn  # noqa: E402
+from santorini.engine import Action, Position, terminal_position, validate_setup, validate_turn  # noqa: E402
 from santorini.native import ACTION_KINDS, encode, CAction, native_search  # noqa: E402
 from santorini import native  # noqa: E402
 
@@ -196,6 +196,10 @@ def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, referenc
     atomic_json(path, data)
     try:
         for ply in range(150):
+            checked = terminal_position(position)
+            if checked.winner is not None:
+                position = checked
+                break
             is_candidate = position.player == job['variant_player']
             if is_candidate:
                 turn, elapsed = candidate_move(position, seconds, checkpoint, socket_path, scratch_dir)
@@ -206,8 +210,6 @@ def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, referenc
                                        'elapsed': elapsed})
             position = turn.after
             atomic_json(path, {**data, 'position': position.to_dict()})
-            if position.winner is not None:
-                break
         data['status'] = 'finished' if position.winner is not None else 'inconclusive'
     except Exception as exc:
         data.update(status='error', error=f'{type(exc).__name__}: {exc}')
