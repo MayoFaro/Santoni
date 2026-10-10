@@ -9,6 +9,8 @@
 use santoni_engine::mcts::{legal_children, terminal_value, Mcts, LeafEvaluator, ACTION_SPACE};
 use santoni_engine::mcts_io::{write_game_atomically, GameRecord};
 use santoni_engine::State;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +18,77 @@ struct UniformEvaluator;
 impl LeafEvaluator for UniformEvaluator {
     fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
         states.iter().map(|_| (vec![1.0 / ACTION_SPACE as f32; ACTION_SPACE], 0.0)).collect()
+    }
+}
+
+/// Évaluateur qui délègue chaque lot de feuilles au serveur d'inférence
+/// Python (Task 7) via le protocole binaire du Task 6
+/// (`santoni_az/inference_protocol.py`) : requête = `u32` LE (nombre
+/// d'états) puis `count * PLANE_BYTES` octets (un encodage de plans par
+/// état, `santoni_engine::mcts::encode_planes`) ; réponse = `u32` LE
+/// (nombre d'items) puis, pour chaque item, `ACTION_SPACE` `f32` LE
+/// (logits de politique) suivis d'un `f32` LE (valeur). Tous les offsets
+/// ci-dessous sont calculés de la même façon que côté Python
+/// (`inference_protocol.pack_request`/`unpack_response`) : get this wrong
+/// and every policy/value the self-play worker sees is silently corrupted.
+///
+/// Le serveur d'inférence (Task 7, `InferenceServer._client_loop` /
+/// `_drain_and_process_once`) traite une seule requête par connexion puis
+/// ferme la socket cliente (`conn.close()` après l'envoi de la réponse) —
+/// comportement confirmé par `tests/test_az_inference_server.py`, qui ouvre
+/// une nouvelle `socket.socket()` à chaque requête plutôt que de réutiliser
+/// une connexion. On se connecte donc à nouveau à chaque appel à
+/// `evaluate` (une connexion persistante ouverte une seule fois dans
+/// `connect` se voit couper par le serveur après le premier aller-retour,
+/// et toute écriture suivante échoue avec `BrokenPipe` — confirmé en
+/// pratique avant ce correctif) ; on ne garde donc que le chemin de la
+/// socket, pas un `UnixStream` déjà ouvert.
+struct SocketEvaluator {
+    path: String,
+}
+
+impl SocketEvaluator {
+    // Ne se connecte pas ici : chaque appel à `evaluate` ouvre sa propre
+    // connexion (le serveur étant un aller-retour par connexion, cf. plus
+    // haut). Une connexion de validation ouverte puis aussitôt abandonnée
+    // ici serait reçue par le serveur comme une connexion sans aucune
+    // donnée avant fermeture -- gérée proprement par le vrai serveur Python
+    // (`InferenceServer._client_loop` ferme simplement si `len(header) < 4`)
+    // mais inutile : la première vraie connexion dans `evaluate` échoue déjà
+    // bruyamment (`.expect(...)`) si le chemin est invalide.
+    fn connect(path: &str) -> Self {
+        Self { path: path.to_string() }
+    }
+}
+
+impl LeafEvaluator for SocketEvaluator {
+    fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
+        let mut stream = UnixStream::connect(&self.path).expect("connexion au serveur d'inférence impossible");
+        let count = states.len() as u32;
+        let mut request = count.to_le_bytes().to_vec();
+        for s in states {
+            request.extend_from_slice(&santoni_engine::mcts::encode_planes(s));
+        }
+        stream.write_all(&request).expect("écriture socket impossible");
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).expect("lecture entête réponse impossible");
+        let n = u32::from_le_bytes(header) as usize;
+        let item_size = ACTION_SPACE * 4 + 4;
+        let mut body = vec![0u8; n * item_size];
+        stream.read_exact(&mut body).expect("lecture corps réponse impossible");
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * item_size;
+            let mut policy = Vec::with_capacity(ACTION_SPACE);
+            for j in 0..ACTION_SPACE {
+                let o = base + j * 4;
+                policy.push(f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]));
+            }
+            let vo = base + ACTION_SPACE * 4;
+            let value = f32::from_le_bytes([body[vo], body[vo + 1], body[vo + 2], body[vo + 3]]);
+            result.push((policy, value));
+        }
+        result
     }
 }
 
@@ -117,13 +190,86 @@ fn main() {
 
     install_sigint_handler();
 
-    let mut evaluator = UniformEvaluator;
+    let socket_path = args.iter().position(|a| a == "--inference-socket").map(|i| args[i + 1].clone());
+    let mut evaluator: Box<dyn LeafEvaluator> = match socket_path {
+        Some(path) => Box::new(SocketEvaluator::connect(&path)),
+        None => Box::new(UniformEvaluator),
+    };
     for i in 0..games {
         if INTERRUPTED.load(Ordering::SeqCst) {
             break;
         }
-        let record = play_one_game(simulations_per_move, &mut evaluator);
+        let record = play_one_game(simulations_per_move, evaluator.as_mut());
         let path = out_dir.join(format!("game-{:04}.json", i));
         write_game_atomically(&path, &record).expect("écriture de partie impossible");
+    }
+}
+
+#[cfg(test)]
+mod socket_evaluator_tests {
+    // `Mcts::run` (native_engine/src/mcts.rs) only ever calls
+    // `evaluator.evaluate(&[state])` with a single-element slice today, so
+    // the end-to-end Python test (tests/test_selfplay_end_to_end.py) never
+    // actually drives `SocketEvaluator` with more than one state per
+    // request. This test exercises that multi-item path directly: a fake
+    // in-process server hand-encodes a 3-item response with distinct,
+    // non-symmetric values per item (so a wrong offset shows up as a
+    // mismatch, not an accidental match against uniform/repeated data), and
+    // we check every float lands back at the right (policy, value) slot in
+    // the right item.
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn evaluate_decodes_a_multi_item_response_at_the_right_offsets() {
+        let dir = std::env::temp_dir().join(format!("selfplay_worker_socket_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("création du répertoire temporaire");
+        let socket_path = dir.join("fake_infer.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind socket factice");
+        let socket_path_str = socket_path.to_str().unwrap().to_string();
+
+        let items: Vec<(Vec<f32>, f32)> = (0..3)
+            .map(|i| {
+                let policy: Vec<f32> = (0..ACTION_SPACE).map(|j| (i * 10_000 + j) as f32 * 0.001).collect();
+                (policy, i as f32 + 0.5)
+            })
+            .collect();
+
+        let server_items = items.clone();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept socket factice");
+            let mut header = [0u8; 4];
+            conn.read_exact(&mut header).expect("lecture entête requête (test)");
+            let n = u32::from_le_bytes(header) as usize;
+            // Drain exactly the request body the real SocketEvaluator sends
+            // (n * PLANE_BYTES), mirroring what the real Python server reads,
+            // so the client's write_all cannot block on an unread buffer.
+            let mut body = vec![0u8; n * 150];
+            conn.read_exact(&mut body).expect("lecture corps requête (test)");
+
+            let mut response = (server_items.len() as u32).to_le_bytes().to_vec();
+            for (policy, value) in &server_items {
+                for p in policy {
+                    response.extend_from_slice(&p.to_le_bytes());
+                }
+                response.extend_from_slice(&value.to_le_bytes());
+            }
+            conn.write_all(&response).expect("écriture réponse factice");
+        });
+
+        let mut evaluator = SocketEvaluator::connect(&socket_path_str);
+        let states = vec![initial_state(), initial_state(), initial_state()];
+        let decoded = evaluator.evaluate(&states);
+        server.join().expect("jointure thread serveur factice");
+
+        assert_eq!(decoded.len(), items.len());
+        for (i, ((got_policy, got_value), (want_policy, want_value))) in decoded.iter().zip(items.iter()).enumerate() {
+            assert_eq!(got_policy.len(), ACTION_SPACE, "item {i}: taille de politique inattendue");
+            assert_eq!(got_policy, want_policy, "item {i}: politique mal décodée (offset incorrect)");
+            assert_eq!(got_value, want_value, "item {i}: valeur mal décodée (offset incorrect)");
+        }
+
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
