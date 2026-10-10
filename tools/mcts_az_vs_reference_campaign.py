@@ -55,6 +55,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import platform
 import random
 import shutil
 import struct
@@ -149,6 +150,16 @@ def freeze_checkpoint(directory, checkpoint_path):
     frozen = json.loads(manifest.read_text())
     if digest(binary) != frozen['checkpoint_sha256']:
         raise ValueError('Candidate checkpoint snapshot integrity mismatch')
+    # Au-dessus, on ne vérifie que la copie figée contre elle-même -- ça ne
+    # détecte jamais une reprise pointée vers un `--checkpoint` différent de
+    # celui de la toute première exécution (revue finale : vérifié qu'une
+    # reprise avec un fichier différent était silencieusement acceptée et
+    # mesurait l'ancien réseau sous le nom de la nouvelle génération).
+    if digest(checkpoint_path) != frozen['checkpoint_sha256']:
+        raise ValueError(
+            f'--checkpoint {checkpoint_path} differs from the checkpoint frozen for this '
+            f'campaign (generation {frozen["generation"]}); choose a new output folder'
+        )
     return binary, frozen
 
 
@@ -293,6 +304,21 @@ def check_manifest_matches(manifest_path, config):
         shutil.copy2(Path(__file__), manifest_path.parent / 'runner.py')
 
 
+def record_run(directory, workers, cpus):
+    """Journal (append-only) d'une ligne par invocation de `main()`, distinct
+    de `campaign.json` : `--workers`/les CPU réellement utilisés varient
+    légitimement d'une reprise à l'autre (ex. reprendre à 2 workers une
+    campagne lancée à 8) et ne doivent donc pas faire partie de la
+    configuration comparée par `check_manifest_matches` -- mais les
+    perdre complètement viderait de sens un win-rate agrégé sur des
+    moitiés de campagne mesurées avec des parallélismes différents
+    (revue finale)."""
+    path = directory / 'runs.json'
+    runs = json.loads(path.read_text()) if path.exists() else []
+    runs.append({'started_at': time.time(), 'workers': workers, 'cpus': cpus})
+    atomic_json(path, runs)
+
+
 def summary(directory, corpus):
     games = [json.loads(p.read_text()) for p in sorted(directory.glob('game-*.json'))]
     finished = [g for g in games if g['status'] == 'finished']
@@ -387,7 +413,41 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     reference_binary, reference_manifest = freeze_reference(directory)
     print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
-    candidate_binary, candidate_manifest = freeze_checkpoint(directory, Path(args.checkpoint))
+    # `freeze_checkpoint` elle-même reste ici, tôt : c'est une vérification
+    # bon marché (quelques hachages) qui peut rejeter la campagne (reprise
+    # avec un `--checkpoint` différent). Le chargement du réseau complet et
+    # le démarrage du vrai `InferenceServer` -- coûteux, et porteurs du
+    # risque documenté dans `InferenceServer.__init__` (thread torch vivant
+    # qui course la fin d'interpréteur) -- sont repoussés après toutes les
+    # validations bon marché ci-dessous, pour qu'un corpus invalide ou une
+    # config incompatible échoue avant d'avoir payé ce coût et ouvert ce
+    # risque pour rien (revue finale).
+    try:
+        candidate_binary, candidate_manifest = freeze_checkpoint(directory, Path(args.checkpoint))
+    except ValueError as exc:
+        parser.error(str(exc))
+    corpus = json.loads(CORPUS.read_text())
+    jobs_all = corpus['jobs']
+    check_corpus_is_no_power(jobs_all)
+    jobs = [{'number': i + 1, 'variant_player': player, 'initial': job}
+            for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
+    if args.limit:
+        jobs = jobs[:args.limit]
+    cpu_model = next((line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
+                       if line.startswith('model name')), 'unknown')
+    config = {'protocol': 'mcts-az-vs-reference-no-power-30s-v1', 'seconds': args.seconds, 'jobs': jobs,
+              'seed': corpus['seed'], 'reference_engine_sha256': reference_manifest['engine_sha256'],
+              'candidate_checkpoint_sha256': candidate_manifest['checkpoint_sha256'],
+              'candidate_checkpoint_generation': candidate_manifest['generation'],
+              'corpus_sha256': digest(CORPUS), 'runner_sha256': digest(Path(__file__)),
+              'cpu_model': cpu_model, 'platform': platform.platform(), 'python': platform.python_version()}
+    try:
+        check_manifest_matches(directory / 'campaign.json', config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    pending = compute_pending_jobs(directory, jobs)
+    cpus = physical_cpus()[:args.workers]
+    record_run(directory, args.workers, cpus)
     net = load_checkpoint_net(candidate_binary)
     socket_path = str(directory / 'infer.sock')
     server = InferenceServer(socket_path, net)
@@ -396,24 +456,6 @@ def main():
     time.sleep(0.1)
     print(f"CANDIDATE checkpoint generation={candidate_manifest['generation']} "
           f"sha256={candidate_manifest['checkpoint_sha256']}", flush=True)
-    corpus = json.loads(CORPUS.read_text())
-    jobs_all = corpus['jobs']
-    check_corpus_is_no_power(jobs_all)
-    jobs = [{'number': i + 1, 'variant_player': player, 'initial': job}
-            for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
-    if args.limit:
-        jobs = jobs[:args.limit]
-    config = {'protocol': 'mcts-az-vs-reference-no-power-30s-v1', 'seconds': args.seconds, 'jobs': jobs,
-              'seed': corpus['seed'], 'reference_engine_sha256': reference_manifest['engine_sha256'],
-              'candidate_checkpoint_sha256': candidate_manifest['checkpoint_sha256'],
-              'candidate_checkpoint_generation': candidate_manifest['generation'],
-              'corpus_sha256': digest(CORPUS), 'runner_sha256': digest(Path(__file__))}
-    try:
-        check_manifest_matches(directory / 'campaign.json', config)
-    except ValueError as exc:
-        parser.error(str(exc))
-    pending = compute_pending_jobs(directory, jobs)
-    cpus = physical_cpus()[:args.workers]
     print(f'START {len(pending)}/{len(jobs)} remaining; {args.seconds}s/move; CPUs {cpus}', flush=True)
     try:
         with ProcessPoolExecutor(max_workers=len(cpus), mp_context=multiprocessing.get_context('spawn'),
@@ -423,7 +465,17 @@ def main():
             while futures:
                 done, futures = wait(futures, timeout=30, return_when=FIRST_COMPLETED)
                 for future in done:
-                    print('GAME ' + json.dumps(future.result()), flush=True)
+                    try:
+                        print('GAME ' + json.dumps(future.result()), flush=True)
+                    except Exception as exc:
+                        # Un enfant tué (OOM, segfault...) lève ici plutôt que
+                        # de renvoyer un résultat ; laisser cette exception
+                        # remonter couperait la boucle avant le FINAL/summary
+                        # ci-dessous, privant l'opérateur du seul rapport
+                        # utile après potentiellement des heures de calcul
+                        # (revue finale). L'état sur disque reste reprenable
+                        # quoi qu'il arrive -- chaque écriture est atomique.
+                        print(f'GAME-FAILED {type(exc).__name__}: {exc}', flush=True)
                 result = summary(directory, corpus)
                 report(directory, result)
                 print(f"PROGRESS {result['completed']}/{len(jobs)}; errors={len(result['errors'])}", flush=True)

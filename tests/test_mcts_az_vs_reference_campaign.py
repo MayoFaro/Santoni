@@ -113,6 +113,24 @@ def test_freeze_checkpoint_detects_tampering_with_the_frozen_copy(tmp_path):
         campaign.freeze_checkpoint(out_dir, checkpoint_path)
 
 
+def test_freeze_checkpoint_rejects_resuming_with_a_different_checkpoint(tmp_path):
+    """Revue finale : `freeze_checkpoint` ne comparait le hash de la copie
+    figée qu'à elle-même, jamais au fichier `--checkpoint` réellement passé
+    en entrée. Une reprise avec un checkpoint différent (même répertoire de
+    sortie) était donc silencieusement acceptée et mesurait l'ancien réseau
+    sous le nom de la nouvelle génération."""
+    trainer, checkpoint_a = make_tiny_checkpoint(tmp_path)
+    checkpoint_b = Path(trainer.save_checkpoint())
+    assert campaign.digest(checkpoint_a) != campaign.digest(checkpoint_b)
+
+    out_dir = tmp_path / 'campaign'
+    out_dir.mkdir()
+    campaign.freeze_checkpoint(out_dir, checkpoint_a)
+
+    with pytest.raises(ValueError):
+        campaign.freeze_checkpoint(out_dir, checkpoint_b)
+
+
 def test_compute_pending_jobs_skips_finished_and_quarantines_incomplete(tmp_path):
     jobs = [{'number': 1, 'variant_player': 0, 'initial': {}},
             {'number': 2, 'variant_player': 1, 'initial': {}},
