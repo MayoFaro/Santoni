@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -110,3 +111,44 @@ def test_freeze_checkpoint_detects_tampering_with_the_frozen_copy(tmp_path):
     binary.write_bytes(b'corrupted')
     with pytest.raises(ValueError):
         campaign.freeze_checkpoint(out_dir, checkpoint_path)
+
+
+def test_compute_pending_jobs_skips_finished_and_quarantines_incomplete(tmp_path):
+    jobs = [{'number': 1, 'variant_player': 0, 'initial': {}},
+            {'number': 2, 'variant_player': 1, 'initial': {}},
+            {'number': 3, 'variant_player': 0, 'initial': {}}]
+    campaign.atomic_json(tmp_path / 'game-0001.json', {'job': jobs[0], 'status': 'finished'})
+    campaign.atomic_json(tmp_path / 'game-0002.json', {'job': jobs[1], 'status': 'running'})
+    # job 3 has no file yet -- a brand new game.
+
+    pending = campaign.compute_pending_jobs(tmp_path, jobs)
+
+    assert [j['number'] for j in pending] == [2, 3]
+    assert not (tmp_path / 'game-0002.json').exists()
+    quarantined = list((tmp_path / 'attempts').glob('game-0002*.json'))
+    assert len(quarantined) == 1
+    assert json.loads(quarantined[0].read_text())['status'] == 'running'
+    assert (tmp_path / 'game-0001.json').exists()  # le fichier terminé n'est jamais touché
+
+
+def test_compute_pending_jobs_rejects_a_job_mismatch(tmp_path):
+    original_job = {'number': 1, 'variant_player': 0, 'initial': {'opening': 'a'}}
+    changed_job = {'number': 1, 'variant_player': 0, 'initial': {'opening': 'b'}}
+    campaign.atomic_json(tmp_path / 'game-0001.json', {'job': original_job, 'status': 'running'})
+    with pytest.raises(ValueError):
+        campaign.compute_pending_jobs(tmp_path, [changed_job])
+
+
+def test_check_manifest_matches_writes_once_then_rejects_changed_config(tmp_path):
+    manifest = tmp_path / 'campaign.json'
+    config = {'seconds': 30.0, 'seed': 1}
+
+    campaign.check_manifest_matches(manifest, config)
+    written = json.loads(manifest.read_text())
+    assert written['seconds'] == 30.0
+    assert 'started_at' in written
+
+    campaign.check_manifest_matches(manifest, config)  # même config : no-op
+
+    with pytest.raises(ValueError):
+        campaign.check_manifest_matches(manifest, {**config, 'seconds': 10.0})

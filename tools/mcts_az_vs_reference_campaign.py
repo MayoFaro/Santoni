@@ -253,6 +253,42 @@ def play(job, directory, seconds, socket_path, scratch_dir, reference_binary):
             'variant_won': position.winner == job['variant_player'] if position.winner is not None else None}
 
 
+def compute_pending_jobs(directory, jobs):
+    """Coups restants à jouer : ignore les parties déjà terminées, met en
+    quarantaine (`attempts/`, suffixe horodaté) les parties incomplètes
+    d'une exécution précédente plutôt que de les écraser silencieusement sur
+    place. Même motif que `tools/hermes_canonicalisation_campaign.py`
+    (lignes ~367-379)."""
+    pending = []
+    for job in jobs:
+        path = directory / f"game-{job['number']:04d}.json"
+        if path.exists():
+            old = json.loads(path.read_text())
+            if old['job'] != job:
+                raise ValueError(f'Job mismatch: {path}')
+            if old['status'] == 'finished':
+                continue
+            attempts = directory / 'attempts'
+            attempts.mkdir(exist_ok=True)
+            path.rename(attempts / f'{path.stem}-{time.time_ns()}.json')
+        pending.append(job)
+    return pending
+
+
+def check_manifest_matches(manifest_path, config):
+    """Écrit `campaign.json` au premier lancement sur ce dossier ; aux
+    lancements suivants, vérifie que la configuration n'a pas changé plutôt
+    que de mélanger silencieusement deux campagnes incompatibles (graine,
+    checkpoint, moteur de référence...) dans le même répertoire."""
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text())
+        if {k: v for k, v in previous.items() if k != 'started_at'} != config:
+            raise ValueError('Campaign provenance/parameters differ; choose a new output folder')
+    else:
+        atomic_json(manifest_path, {'started_at': time.time(), **config})
+        shutil.copy2(Path(__file__), manifest_path.parent / 'runner.py')
+
+
 def summary(directory, corpus):
     games = [json.loads(p.read_text()) for p in sorted(directory.glob('game-*.json'))]
     finished = [g for g in games if g['status'] == 'finished']
@@ -324,6 +360,9 @@ def main():
     verify_reference()
     directory = Path(args.out)
     directory.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock = (directory / '.campaign.lock').open('w')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     reference_binary, reference_manifest = freeze_reference(directory)
     print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
     candidate_binary, candidate_manifest = freeze_checkpoint(directory, Path(args.checkpoint))
@@ -342,11 +381,21 @@ def main():
             for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
     if args.limit:
         jobs = jobs[:args.limit]
+    config = {'protocol': 'mcts-az-vs-reference-no-power-30s-v1', 'seconds': args.seconds, 'jobs': jobs,
+              'seed': corpus['seed'], 'reference_engine_sha256': reference_manifest['engine_sha256'],
+              'candidate_checkpoint_sha256': candidate_manifest['checkpoint_sha256'],
+              'candidate_checkpoint_generation': candidate_manifest['generation'],
+              'corpus_sha256': digest(CORPUS), 'runner_sha256': digest(Path(__file__))}
+    try:
+        check_manifest_matches(directory / 'campaign.json', config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    pending = compute_pending_jobs(directory, jobs)
     try:
         with tempfile.TemporaryDirectory() as scratch:
             scratch_dir = Path(scratch)
             results = [play(job, directory, args.seconds, socket_path, scratch_dir, reference_binary)
-                       for job in jobs]
+                       for job in pending]
     finally:
         server.stop()
     result = summary(directory, corpus)
