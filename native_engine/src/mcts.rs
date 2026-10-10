@@ -196,8 +196,26 @@ impl Mcts {
             noise.len(),
             "le bruit doit avoir une valeur par coup légal à la racine"
         );
+        // Les priors stockés dans `Edge::prior` sont les logits bruts
+        // renvoyés par `LeafEvaluator::evaluate` (cf. `simulate_one`), pas
+        // une distribution de probabilité : un réseau non entraîné les
+        // renvoie centrés sur 0, ~moitié négatifs (mesuré en revue finale).
+        // `noise` (sortie de `dirichlet_noise`, bin/selfplay_worker.rs) est
+        // en revanche une vraie distribution sommant à 1. Mélanger les deux
+        // tels quels n'a aucune sémantique de probabilité et rend `epsilon`
+        // sans effet mesurable dès que l'échelle des logits dépasse celle du
+        // bruit — exactement le bruit "inerte" que ce mélange est censé
+        // éviter. Softmaxer les priors ici, juste avant le mélange, leur
+        // donne la même échelle que `noise` sans toucher à `run_single_move`
+        // (chemin d'arbitrage, qui n'appelle jamais `mix_root_noise`).
+        let max = node.edges.iter().map(|e| e.prior).fold(f32::NEG_INFINITY, f32::max);
+        let mut total = 0.0f32;
+        for edge in node.edges.iter_mut() {
+            edge.prior = (edge.prior - max).exp();
+            total += edge.prior;
+        }
         for (edge, &n) in node.edges.iter_mut().zip(noise) {
-            edge.prior = edge.prior * (1.0 - epsilon) + n * epsilon;
+            edge.prior = (edge.prior / total) * (1.0 - epsilon) + n * epsilon;
         }
     }
 
@@ -249,13 +267,19 @@ impl Mcts {
         value
     }
 
-    /// Coups légaux à la racine avec leur nombre de visites, pour construire
-    /// la cible de politique de l'entraînement.
-    pub fn visit_counts(&self) -> Vec<(Action, Action, u32)> {
+    /// Coups légaux à la racine avec leur nombre de visites et l'état
+    /// résultant, pour construire la cible de politique de l'entraînement
+    /// et avancer la partie sans recalculer `legal_children` séparément —
+    /// un second appel recomputant les mêmes coups légaux dans un ordre
+    /// supposé identique est exactement le genre de couplage non vérifié
+    /// qu'une revue a signalé (ordre de `visit_counts` vs `legal_children`
+    /// jamais garanti égal par le système de types) ; porter `after` ici
+    /// l'élimine par construction plutôt que par convention.
+    pub fn visit_counts(&self) -> Vec<(Action, Action, State, u32)> {
         self.nodes[&self.root]
             .edges
             .iter()
-            .map(|e| (e.mv, e.bld, e.visits))
+            .map(|e| (e.mv, e.bld, e.after, e.visits))
             .collect()
     }
 }
@@ -383,7 +407,7 @@ mod mcts_tree_tests {
         let mut eval = UniformEvaluator;
         mcts.run(50, &mut eval);
         let counts = mcts.visit_counts();
-        let total: u32 = counts.iter().map(|(_, _, n)| n).sum();
+        let total: u32 = counts.iter().map(|(_, _, _, n)| n).sum();
         assert_eq!(total, 50);
     }
 
@@ -443,9 +467,9 @@ mod mcts_tree_tests {
         mcts.mix_root_noise(&noise, 1.0);
         mcts.run(200, &mut eval);
         let counts = mcts.visit_counts();
-        let noised_visits = counts[0].2;
+        let noised_visits = counts[0].3;
         assert!(
-            counts.iter().all(|(_, _, n)| *n <= noised_visits),
+            counts.iter().all(|(_, _, _, n)| *n <= noised_visits),
             "l'arête bruitée doit recevoir au moins autant de visites que les autres"
         );
         assert!(
@@ -460,5 +484,72 @@ mod mcts_tree_tests {
         let s = default_state();
         let mut mcts = Mcts::new(s, 1.5);
         mcts.mix_root_noise(&[1.0], 0.25);
+    }
+
+    /// Évaluateur renvoyant des logits bruts non normalisés (n'importe quelle
+    /// échelle, y compris négative) plutôt qu'une distribution de
+    /// probabilité — c'est exactement ce que renvoie un réseau non entraîné
+    /// (mesuré en revue finale : moyenne ~0, écart-type ~0.5, ~moitié de
+    /// valeurs négatives), et ce que `SocketEvaluator` (bin/selfplay_worker.rs)
+    /// transmet tel quel depuis le serveur d'inférence.
+    struct RawLogitEvaluator;
+    impl LeafEvaluator for RawLogitEvaluator {
+        fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
+            states
+                .iter()
+                .map(|_| {
+                    let mut p = vec![0.0f32; ACTION_SPACE];
+                    for (i, v) in p.iter_mut().enumerate() {
+                        *v = ((i % 5) as f32 - 2.0) * 0.75; // {-1.5,-0.75,0,0.75,1.5}, pas une distribution
+                    }
+                    (p, 0.0)
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn mix_root_noise_still_biases_toward_the_noised_edge_with_raw_logit_scale_priors() {
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = RawLogitEvaluator;
+        mcts.ensure_root_expanded(&mut eval);
+        let n_edges = mcts.visit_counts().len();
+        assert!(n_edges > 1, "fixture doit offrir plusieurs coups légaux pour que le test ait un sens");
+        let mut noise = vec![0.0f32; n_edges];
+        // L'arête 0 reçoit le prior brut le plus négatif (((0 % 5) as f32 -
+        // 2.0) * 0.75 == -1.5) : sans normalisation, mélanger du bruit à
+        // epsilon=0.25 ne suffit pas à la sortir de son déficit de prior, et
+        // elle reste activement repoussée par le terme d'exploration UCB.
+        noise[0] = 1.0;
+        mcts.mix_root_noise(&noise, 0.25); // DIRICHLET_EPSILON (bin/selfplay_worker.rs)
+        mcts.run(400, &mut eval);
+        let counts = mcts.visit_counts();
+        let noised_visits = counts[0].3;
+        let max_other = counts.iter().skip(1).map(|(_, _, _, n)| *n).max().unwrap();
+        assert!(
+            noised_visits > max_other,
+            "avec epsilon=0.25 et un bruit concentré, l'arête bruitée doit recevoir plus de visites \
+             que n'importe quelle autre même à l'échelle de logits bruts non normalisés ; \
+             trouvé noised={noised_visits}, max autre={max_other}"
+        );
+    }
+
+    #[test]
+    fn visit_counts_returns_the_after_state_matching_legal_children() {
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = UniformEvaluator;
+        mcts.ensure_root_expanded(&mut eval);
+        let counts = mcts.visit_counts();
+        let legal = legal_children(&s);
+        assert_eq!(counts.len(), legal.len());
+        for ((cmv, cbld, cafter, _), (lmv, lbld, lafter)) in counts.iter().zip(legal.iter()) {
+            assert_eq!(cmv, lmv);
+            assert_eq!(cbld, lbld);
+            assert_eq!(cafter, lafter);
+        }
     }
 }

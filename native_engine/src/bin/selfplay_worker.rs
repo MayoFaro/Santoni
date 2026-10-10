@@ -6,7 +6,7 @@
 //! Aucune dépendance externe (règle du projet, cf. `native_engine/src/lib.rs`) :
 //! l'arrêt propre sur SIGINT appelle directement `signal(2, ...)` de la libc
 //! via une déclaration `extern "C"` manuelle plutôt qu'une crate comme `ctrlc`.
-use santoni_engine::mcts::{legal_children, terminal_value, Mcts, LeafEvaluator, ACTION_SPACE};
+use santoni_engine::mcts::{terminal_value, Mcts, LeafEvaluator, ACTION_SPACE};
 use santoni_engine::mcts_io::{write_game_atomically, GameRecord, PositionRecord};
 use santoni_engine::{Action, State};
 use std::io::{Read, Write};
@@ -258,11 +258,16 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, r
         let noise = dirichlet_noise(&mut rng, n_edges, DIRICHLET_ALPHA);
         mcts.mix_root_noise(&noise, DIRICHLET_EPSILON);
         mcts.run(simulations_per_move, evaluator);
+        // `visit_counts()` porte directement l'état résultant (`after`) de
+        // chaque coup légal : pas de second appel à `legal_children` dont
+        // l'ordre devrait, par convention non vérifiée par le compilateur,
+        // coïncider avec celui de `visit_counts` (cf. revue finale — un tel
+        // désalignement silencieux mélangerait la distribution de visites
+        // d'une position avec l'état résultant d'une autre).
         let counts = mcts.visit_counts();
-        let legal = legal_children(&state);
         let visits: Vec<(usize, u32)> = counts
             .iter()
-            .map(|(mv, bld, n)| {
+            .map(|(mv, bld, _after, n)| {
                 let worker_slot = state.workers[state.player as usize]
                     .iter()
                     .position(|&c| c == mv.source)
@@ -271,12 +276,12 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, r
             })
             .collect();
         let chosen = if positions.len() < TEMPERATURE_PLIES {
-            let weights: Vec<u32> = counts.iter().map(|(_, _, n)| *n).collect();
+            let weights: Vec<u32> = counts.iter().map(|(_, _, _, n)| *n).collect();
             sample_weighted(&mut rng, &weights)
         } else {
-            counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0
+            counts.iter().enumerate().max_by_key(|(_, (_, _, _, n))| *n).unwrap().0
         };
-        let (_, _, after) = legal[chosen];
+        let after = counts[chosen].2;
         positions.push(PositionRecord { planes, visits });
         state = after;
     }
@@ -367,9 +372,8 @@ fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, e
         }
     }
     let counts = mcts.visit_counts();
-    let legal = legal_children(&state);
-    let best = counts.iter().enumerate().max_by_key(|(_, (_, _, n))| *n).unwrap().0;
-    let (mv, bld, after) = legal[best];
+    let best = counts.iter().enumerate().max_by_key(|(_, (_, _, _, n))| *n).unwrap().0;
+    let (mv, bld, after, _) = counts[best];
 
     // Un tour gagnant n'a qu'une action. Dans le sous-jeu sans pouvoir,
     // `apply` (lib.rs) ne positionne `winner` que sur un déplacement montant
