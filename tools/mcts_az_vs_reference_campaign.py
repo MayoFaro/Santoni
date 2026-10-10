@@ -1,0 +1,206 @@
+"""200 parties appariées, candidat (MCTS + réseau, sous-jeu sans pouvoir) contre
+le moteur de référence figé, budget de temps égal par tour. Même corpus et même
+méthode de bootstrap par groupe de placement que
+`tools/hermes_canonicalisation_campaign.py` ; reprend directement `digest`,
+`verify_reference`, `atomic_json`, `bootstrap` de ce script (voir ses lignes
+45-61 et 213-221 pour la provenance).
+
+Décodage des actions : le worker (`--single-move`, Task 11) renvoie deux
+`CAction` bruts (déplacement puis deuxième action). Le `kind` de la deuxième
+action n'est pas toujours « build » (1) — sur une position de milieu/fin de
+partie quelconque du corpus, un tour gagnant peut se terminer par un dôme
+(`kind == 2`) plutôt qu'une construction. On décode donc le `kind` des deux
+actions via `ACTION_KINDS`, exactement comme `santorini.native.decode_turn`,
+au lieu de supposer `"move"`/`"build"` en dur (risque signalé par la revue de
+la Task 11, qui ne l'avait pas détecté : son propre test ne couvre que la
+position de départ fixe, où un tour gagnant en un coup ne peut jamais se
+clore par un dôme).
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes as C
+import hashlib
+import json
+import random
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+REFERENCE = ROOT / 'experiments/references/b698745'
+CORPUS = ROOT / 'experiments/selfplay-100-5s-20261005/campaign.json'
+WORKER_BINARY = ROOT / 'native_engine' / 'target' / 'release' / 'selfplay_worker'
+
+sys.path.insert(0, str(ROOT))
+from santorini.engine import Action, Position, validate_setup, validate_turn  # noqa: E402
+from santorini.native import ACTION_KINDS, encode, CAction, native_search  # noqa: E402
+from santorini import native  # noqa: E402
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_reference():
+    meta = json.loads((REFERENCE / 'reference.json').read_text())
+    for name, key in [('libsantoni_engine.so', 'binary_sha256'), ('source.tar.gz', 'archive_sha256')]:
+        if digest(REFERENCE / name) != meta[key]:
+            raise ValueError(f'Reference integrity mismatch: {name}')
+    return meta
+
+
+def atomic_json(path, value):
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+    tmp.replace(path)
+
+
+def bootstrap(groups):
+    rng = random.Random(20261010)
+    values = list(groups.values())
+    samples = []
+    for _ in range(5000):
+        selected = [rng.choice(values) for _ in values]
+        samples.append(sum(sum(v) for v in selected) / sum(len(v) for v in selected))
+    samples.sort()
+    return [samples[125], samples[4874]]
+
+
+def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
+    state = encode(position)
+    input_path = scratch_dir / 'state.bin'
+    output_path = scratch_dir / 'move.bin'
+    input_path.write_bytes(bytes(state))
+    if output_path.exists():
+        output_path.unlink()
+    cmd = [str(WORKER_BINARY), '--single-move', '--input-state', str(input_path),
+           '--output-move', str(output_path), '--seconds', str(seconds)]
+    if socket_path:
+        cmd += ['--inference-socket', str(socket_path)]
+    started = time.monotonic()
+    result = subprocess.run(cmd, timeout=seconds + 10, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f'Candidate worker failed: {result.stderr}')
+    raw = output_path.read_bytes()
+    move_action = CAction.from_buffer_copy(raw, 0)
+    build_action = CAction.from_buffer_copy(raw, C.sizeof(CAction))
+    # Décodage générique du `kind` (voir santorini.native.decode_turn) : ne
+    # jamais supposer "move"/"build" en dur, la deuxième action peut être un
+    # dôme (kind 2) sur une position arbitraire du corpus.
+    actions = (
+        Action(ACTION_KINDS[move_action.kind], move_action.player, move_action.worker,
+               move_action.source, move_action.target),
+        Action(ACTION_KINDS[build_action.kind], build_action.player, build_action.worker,
+               build_action.source, build_action.target),
+    )
+    turn = validate_turn(position, actions)
+    return turn, time.monotonic() - started
+
+
+def reference_move(position, seconds):
+    analysis = native_search(position, seconds)
+    if analysis.turn is None:
+        raise ValueError('Reference engine returned no legal turn')
+    return analysis.turn, analysis.elapsed
+
+
+def play(job, directory, seconds, checkpoint, socket_path, scratch_dir):
+    initial = job['initial']
+    path = Path(directory) / f"game-{job['number']:04d}.json"
+    position = validate_setup(initial['workers'], initial['powers'], initial['first'])
+    data = {'job': job, 'status': 'running', 'decisions': []}
+    atomic_json(path, data)
+    try:
+        for ply in range(150):
+            is_candidate = position.player == job['variant_player']
+            if is_candidate:
+                turn, elapsed = candidate_move(position, seconds, checkpoint, socket_path, scratch_dir)
+            else:
+                turn, elapsed = reference_move(position, seconds)
+            data['decisions'].append({'ply': ply + 1, 'player': position.player,
+                                       'backend': 'candidate' if is_candidate else 'reference',
+                                       'elapsed': elapsed})
+            position = turn.after
+            atomic_json(path, {**data, 'position': position.to_dict()})
+            if position.winner is not None:
+                break
+        data['status'] = 'finished' if position.winner is not None else 'inconclusive'
+    except Exception as exc:
+        data.update(status='error', error=f'{type(exc).__name__}: {exc}')
+    data['winner'] = position.winner
+    atomic_json(path, data)
+    return {'number': job['number'], 'status': data['status'],
+            'variant_won': position.winner == job['variant_player'] if position.winner is not None else None}
+
+
+def summary(directory, corpus):
+    games = [json.loads(p.read_text()) for p in sorted(directory.glob('game-*.json'))]
+    finished = [g for g in games if g['status'] == 'finished']
+    groups = defaultdict(list)
+    for game in finished:
+        job = game['job']
+        won = int(game['winner'] == job['variant_player'])
+        key = (tuple(job['initial']['matchup']), job['initial']['opening'])
+        groups[key].append(won)
+    wins = sum(sum(v) for v in groups.values())
+    result = {'expected': 200, 'completed': len(finished), 'candidate_wins': wins,
+               'reference_wins': len(finished) - wins,
+               'win_rate': wins / len(finished) if finished else None,
+               'errors': [{'game': g['job']['number'], 'error': g.get('error')} for g in games
+                          if g['status'] in ('error', 'inconclusive')]}
+    if len(finished) == 200:
+        result['placement_bootstrap_95'] = bootstrap(groups)
+        result['placement_groups'] = len(groups)
+    atomic_json(directory / 'summary.json', result)
+    return result
+
+
+def report(directory, result):
+    lines = ['# Candidat MCTS + réseau contre le moteur de référence figé (sous-jeu sans pouvoir)', '',
+             f"Parties terminées : {result['completed']}/{result['expected']}.", '']
+    if result['win_rate'] is not None:
+        lines.append(f"Victoires du candidat : {result['candidate_wins']} / {result['completed']} "
+                      f"({result['win_rate']*100:.1f} %).")
+    if 'placement_bootstrap_95' in result:
+        lines.append(f"Intervalle bootstrap à 95 % par groupe de placement "
+                      f"({result['placement_groups']} groupes) : {result['placement_bootstrap_95']}.")
+    lines += ['', f"Erreurs ou parties non conclues : {len(result['errors'])}."]
+    (directory / 'rapport.md').write_text('\n'.join(lines) + '\n')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--seconds', type=float, default=30.0)
+    parser.add_argument('--inference-socket', default=None,
+                         help='Socket du serveur d\'inférence déjà démarré ; sans cette option, '
+                              'le worker utilise un évaluateur uniforme (politique aléatoire).')
+    parser.add_argument('--out', required=True)
+    parser.add_argument('--limit', type=int, default=None,
+                         help='Only run the first N scheduled games (pilot runs); '
+                              'same convention as tools/hermes_canonicalisation_campaign.py --limit.')
+    args = parser.parse_args()
+    verify_reference()
+    corpus = json.loads(CORPUS.read_text())
+    jobs_all = corpus['jobs']
+    jobs = [{'number': i + 1, 'variant_player': player, 'initial': job}
+            for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
+    if args.limit:
+        jobs = jobs[:args.limit]
+    directory = Path(args.out)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch_dir = Path(scratch)
+        results = [play(job, directory, args.seconds, args.checkpoint, args.inference_socket, scratch_dir)
+                   for job in jobs]
+    result = summary(directory, corpus)
+    report(directory, result)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == '__main__':
+    main()
