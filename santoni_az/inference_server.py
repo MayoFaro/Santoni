@@ -83,23 +83,36 @@ class InferenceServer:
             threading.Thread(target=self._client_loop, args=(conn,), daemon=True).start()
 
     def _client_loop(self, conn):
-        header = conn.recv(4)
-        if len(header) < 4:
-            conn.close()
-            return
-        (count,) = struct.unpack("<I", header)
-        body = b""
-        while len(body) < count * PLANE_BYTES:
-            body += conn.recv(count * PLANE_BYTES - len(body))
-        planes_list = unpack_request(header + body)
-        with self._lock:
-            if not self._running:
-                # Server is shutting down: the flush thread may already
-                # have exited, so queuing here would leave this client
-                # hanging on recv() forever. Close instead of stranding it.
+        while True:
+            try:
+                header = conn.recv(4)
+            except OSError:
                 conn.close()
                 return
-            self._pending.append((planes_list, conn))
+            if len(header) < 4:
+                conn.close()
+                return
+            (count,) = struct.unpack("<I", header)
+            body = b""
+            while len(body) < count * PLANE_BYTES:
+                try:
+                    chunk = conn.recv(count * PLANE_BYTES - len(body))
+                except OSError:
+                    conn.close()
+                    return
+                if not chunk:
+                    conn.close()
+                    return
+                body += chunk
+            planes_list = unpack_request(header + body)
+            with self._lock:
+                if not self._running:
+                    # Server is shutting down: the flush thread may already
+                    # have exited, so queuing here would leave this client
+                    # hanging on recv() forever. Close instead of stranding it.
+                    conn.close()
+                    return
+                self._pending.append((planes_list, conn))
 
     def _drain_and_process_once(self):
         """Take whatever is currently in `_pending`, run one forward pass
@@ -125,7 +138,11 @@ class InferenceServer:
             response = pack_response(policies[offset:offset + n], values[offset:offset + n])
             try:
                 conn.sendall(response)
-            finally:
+            except OSError:
+                # Le worker a disparu entre sa requête et la réponse : on
+                # referme notre côté, mais on ne laisse pas l'exception
+                # remonter dans le thread de flush (qui arrêterait tout
+                # batching futur pour les autres connexions en attente).
                 conn.close()
             offset += n
 
