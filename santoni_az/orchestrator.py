@@ -72,6 +72,13 @@ class Orchestrator:
         # checkpoint ; `None` = aucune encore faite dans ce processus. Lu et
         # écrit uniquement par `_train_loop`.
         self._last_save = None
+        # Dernière perte renvoyée par un vrai pas de gradient (`None` =
+        # aucun encore eu dans ce processus ; `train_step` renvoie
+        # exactement `0.0` quand sa file est vide, cf. `_train_loop`, donc
+        # `None` reste le seul moyen non ambigu de dire "pas encore
+        # entraîné" plutôt que "perte nulle"). Lu et écrit uniquement par
+        # `_train_loop`, exposé en lecture via `status()`.
+        self._last_loss = None
         # Guards reads of self.trainer.generation / self._workers against
         # the background _train_loop thread so status() never observes a
         # torn mid-mutation state (e.g. Trainer.save_checkpoint()
@@ -123,6 +130,9 @@ class Orchestrator:
             self.trainer.consume_new_games()
             loss = self.trainer.train_step()
             trained = loss != 0.0
+            if trained:
+                with self._status_lock:
+                    self._last_loss = loss
             now = time.monotonic()
             due = self._last_save is None or now - self._last_save >= MIN_CHECKPOINT_INTERVAL_S
             if trained and due:
@@ -152,8 +162,10 @@ class Orchestrator:
         alive = sum(1 for p in self._workers if p.poll() is None)
         with self._status_lock:
             generation = self.trainer.generation
+            last_loss = self._last_loss
         return {
             "generation": generation,
             "games_available": len(list(self.games_dir.glob("game-*.json"))),
             "workers_alive": alive,
+            "last_loss": last_loss,
         }
