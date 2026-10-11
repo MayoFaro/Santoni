@@ -36,10 +36,15 @@ impl LeafEvaluator for UniformEvaluator {
 /// premier appel à `evaluate` puis réutilisée pour tous les appels suivants,
 /// y compris entre deux parties successives (le serveur d'inférence,
 /// `InferenceServer._client_loop`, boucle lui aussi sur la même connexion
-/// plutôt que de la fermer après un seul échange). Ceci élimine le coût de
-/// `connect()`/poll `accept()` (jusqu'à 0.1s dans le pire cas, cf.
-/// `InferenceServer._listener.settimeout`) qui dominait chaque aller-retour
-/// quand une nouvelle connexion était ouverte à chaque feuille évaluée. En
+/// plutôt que de la fermer après un seul échange). Ceci élimine le
+/// connect()/accept()/spawn-de-thread/close() répété à chaque feuille
+/// évaluée (mesuré : ~241 connexions en 5s à un seul coup → 1 ; environ
+/// 10% d'un cœur de CPU système récupéré sous forte cadence). Mesuré aussi :
+/// ceci ne change quasiment pas le débit (46.9 → 47.1 req/s à
+/// `flush_interval_s` par défaut) — le coût dominant par aller-retour n'est
+/// pas la connexion (~21ms mesurés, pas 100-200ms) mais l'intervalle de
+/// scrutation `InferenceServer.flush_interval_s` lui-même (7.3x de gain
+/// mesuré en l'abaissant seul, sans ce correctif). En
 /// cas d'erreur d'E/S sur la connexion existante (pipe brisé, serveur
 /// redémarré), `evaluate` referme le flux mort, en rouvre un nouveau, et
 /// rejoue la même requête une fois ; un second échec se propage normalement

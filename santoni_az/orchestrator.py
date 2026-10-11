@@ -43,16 +43,20 @@ class Orchestrator:
         # shutdown-latency bound already measured and accepted below for
         # this exact value.
         #
-        # The worker (Task 8) only checks the SIGINT-set interrupt flag
-        # between games, never between individual simulations/moves (see the
-        # comment above `INTERRUPTED` in native_engine/src/bin/selfplay_worker.rs),
+        # The worker only checks the SIGINT-set interrupt flag between
+        # games, never between individual simulations/moves (see the comment
+        # above `INTERRUPTED` in native_engine/src/bin/selfplay_worker.rs),
         # and every simulation is its own request/response round trip
-        # through InferenceServer (Task 7) rather than a batched call.
-        # Measured empirically against the real server in this environment:
-        # each round trip costs on the order of 100-200ms (dominated by
-        # InferenceServer._accept_loop's 0.1s accept() poll interval, which
-        # this task must not change -- Task 7 is already approved), so a
-        # single game at 32 simulations/move can take 20-30s to reach the
+        # through InferenceServer rather than a batched call. Measured
+        # empirically against the real server in this environment: each
+        # round trip costs on the order of 20ms at the default
+        # `flush_interval_s=0.02` -- not dominated by connection setup
+        # (reusing one persistent connection per worker instead of
+        # reconnecting per leaf changed this cost by under 1%, see the
+        # doc-comment on `SocketEvaluator` in selfplay_worker.rs) but by this
+        # periodic flush interval itself, which this task must not change.
+        # A full game runs many moves, each needing 32 such round trips, so
+        # a single game can still take on the order of 10-20s to reach the
         # next interrupt check. stop() would then have to block that long
         # before a SIGINT takes effect -- bounded and predictable, which is
         # what matters here, not minimal; this is a process-wiring choice
