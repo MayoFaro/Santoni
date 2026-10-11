@@ -23,60 +23,64 @@ impl LeafEvaluator for UniformEvaluator {
 }
 
 /// Évaluateur qui délègue chaque lot de feuilles au serveur d'inférence
-/// Python (Task 7) via le protocole binaire du Task 6
-/// (`santoni_az/inference_protocol.py`) : requête = `u32` LE (nombre
-/// d'états) puis `count * PLANE_BYTES` octets (un encodage de plans par
-/// état, `santoni_engine::mcts::encode_planes`) ; réponse = `u32` LE
-/// (nombre d'items) puis, pour chaque item, `ACTION_SPACE` `f32` LE
-/// (logits de politique) suivis d'un `f32` LE (valeur). Tous les offsets
-/// ci-dessous sont calculés de la même façon que côté Python
-/// (`inference_protocol.pack_request`/`unpack_response`) : get this wrong
-/// and every policy/value the self-play worker sees is silently corrupted.
+/// Python via le protocole binaire (`santoni_az/inference_protocol.py`) :
+/// requête = `u32` LE (nombre d'états) puis `count * PLANE_BYTES` octets (un
+/// encodage de plans par état, `santoni_engine::mcts::encode_planes`) ;
+/// réponse = `u32` LE (nombre d'items) puis, pour chaque item, `ACTION_SPACE`
+/// `f32` LE (logits de politique) suivis d'un `f32` LE (valeur). Tous les
+/// offsets ci-dessous sont calculés de la même façon que côté Python
+/// (`inference_protocol.pack_request`/`unpack_response`) : get this wrong and
+/// every policy/value the self-play worker sees is silently corrupted.
 ///
-/// Le serveur d'inférence (Task 7, `InferenceServer._client_loop` /
-/// `_drain_and_process_once`) traite une seule requête par connexion puis
-/// ferme la socket cliente (`conn.close()` après l'envoi de la réponse) —
-/// comportement confirmé par `tests/test_az_inference_server.py`, qui ouvre
-/// une nouvelle `socket.socket()` à chaque requête plutôt que de réutiliser
-/// une connexion. On se connecte donc à nouveau à chaque appel à
-/// `evaluate` (une connexion persistante ouverte une seule fois dans
-/// `connect` se voit couper par le serveur après le premier aller-retour,
-/// et toute écriture suivante échoue avec `BrokenPipe` — confirmé en
-/// pratique avant ce correctif) ; on ne garde donc que le chemin de la
-/// socket, pas un `UnixStream` déjà ouvert.
+/// La connexion est persistante : une seule `UnixStream` est ouverte au
+/// premier appel à `evaluate` puis réutilisée pour tous les appels suivants,
+/// y compris entre deux parties successives (le serveur d'inférence,
+/// `InferenceServer._client_loop`, boucle lui aussi sur la même connexion
+/// plutôt que de la fermer après un seul échange). Ceci élimine le coût de
+/// `connect()`/poll `accept()` (jusqu'à 0.1s dans le pire cas, cf.
+/// `InferenceServer._listener.settimeout`) qui dominait chaque aller-retour
+/// quand une nouvelle connexion était ouverte à chaque feuille évaluée. En
+/// cas d'erreur d'E/S sur la connexion existante (pipe brisé, serveur
+/// redémarré), `evaluate` referme le flux mort, en rouvre un nouveau, et
+/// rejoue la même requête une fois ; un second échec se propage normalement
+/// (panic), ce cas restant aussi rare qu'avant ce correctif.
 struct SocketEvaluator {
     path: String,
+    stream: Option<UnixStream>,
 }
 
 impl SocketEvaluator {
-    // Ne se connecte pas ici : chaque appel à `evaluate` ouvre sa propre
-    // connexion (le serveur étant un aller-retour par connexion, cf. plus
-    // haut). Une connexion de validation ouverte puis aussitôt abandonnée
-    // ici serait reçue par le serveur comme une connexion sans aucune
-    // donnée avant fermeture -- gérée proprement par le vrai serveur Python
-    // (`InferenceServer._client_loop` ferme simplement si `len(header) < 4`)
-    // mais inutile : la première vraie connexion dans `evaluate` échoue déjà
-    // bruyamment (`.expect(...)`) si le chemin est invalide.
+    // Ne se connecte pas ici : la connexion s'ouvre au premier appel à
+    // `evaluate` (dans `ensure_connected`), pas à la construction — un
+    // worker qui démarre avant que le serveur d'inférence soit prêt doit
+    // pouvoir être instancié sans échouer immédiatement ; l'échec, s'il a
+    // lieu, se manifeste seulement au premier vrai besoin de la connexion.
     fn connect(path: &str) -> Self {
-        Self { path: path.to_string() }
+        Self { path: path.to_string(), stream: None }
     }
-}
 
-impl LeafEvaluator for SocketEvaluator {
-    fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
-        let mut stream = UnixStream::connect(&self.path).expect("connexion au serveur d'inférence impossible");
+    fn ensure_connected(&mut self) -> &mut UnixStream {
+        if self.stream.is_none() {
+            let stream = UnixStream::connect(&self.path).expect("connexion au serveur d'inférence impossible");
+            self.stream = Some(stream);
+        }
+        self.stream.as_mut().unwrap()
+    }
+
+    fn try_evaluate(&mut self, states: &[State]) -> std::io::Result<Vec<(Vec<f32>, f32)>> {
+        let stream = self.ensure_connected();
         let count = states.len() as u32;
         let mut request = count.to_le_bytes().to_vec();
         for s in states {
             request.extend_from_slice(&santoni_engine::mcts::encode_planes(s));
         }
-        stream.write_all(&request).expect("écriture socket impossible");
+        stream.write_all(&request)?;
         let mut header = [0u8; 4];
-        stream.read_exact(&mut header).expect("lecture entête réponse impossible");
+        stream.read_exact(&mut header)?;
         let n = u32::from_le_bytes(header) as usize;
         let item_size = ACTION_SPACE * 4 + 4;
         let mut body = vec![0u8; n * item_size];
-        stream.read_exact(&mut body).expect("lecture corps réponse impossible");
+        stream.read_exact(&mut body)?;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             let base = i * item_size;
@@ -89,7 +93,24 @@ impl LeafEvaluator for SocketEvaluator {
             let value = f32::from_le_bytes([body[vo], body[vo + 1], body[vo + 2], body[vo + 3]]);
             result.push((policy, value));
         }
-        result
+        Ok(result)
+    }
+}
+
+impl LeafEvaluator for SocketEvaluator {
+    fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
+        match self.try_evaluate(states) {
+            Ok(result) => result,
+            Err(_) => {
+                // Connexion morte (pipe brisé, serveur redémarré) : on
+                // referme et rouvre une nouvelle connexion, puis on rejoue
+                // la même requête une fois.
+                self.stream = None;
+                self.try_evaluate(states).expect(
+                    "connexion au serveur d'inférence impossible après une tentative de reconnexion",
+                )
+            }
+        }
     }
 }
 
@@ -521,6 +542,93 @@ mod socket_evaluator_tests {
             assert_eq!(got_value, want_value, "item {i}: valeur mal décodée (offset incorrect)");
         }
 
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn evaluate_reuses_the_same_connection_across_calls() {
+        let dir = std::env::temp_dir().join(format!("selfplay_worker_reuse_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("création du répertoire temporaire");
+        let socket_path = dir.join("fake_infer_reuse.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind socket factice");
+        let socket_path_str = socket_path.to_str().unwrap().to_string();
+
+        let accept_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let accept_count_server = accept_count.clone();
+        let server = std::thread::spawn(move || {
+            // Une seule connexion attendue : si evaluate() en rouvrait une à
+            // chaque appel, ce unique accept() ne verrait jamais la seconde
+            // requête (détecté ci-dessous via un timeout plutôt qu'un
+            // blocage permanent du thread client).
+            let (mut conn, _) = listener.accept().expect("accept socket factice");
+            accept_count_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..2 {
+                let mut header = [0u8; 4];
+                conn.read_exact(&mut header).expect("lecture entête requête (test)");
+                let n = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; n * 150];
+                conn.read_exact(&mut body).expect("lecture corps requête (test)");
+                let mut response = 1u32.to_le_bytes().to_vec();
+                response.extend_from_slice(&vec![0u8; ACTION_SPACE * 4]);
+                response.extend_from_slice(&0.0f32.to_le_bytes());
+                conn.write_all(&response).expect("écriture réponse factice");
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut evaluator = SocketEvaluator::connect(&socket_path_str);
+            let states = vec![initial_state()];
+            evaluator.evaluate(&states);
+            evaluator.evaluate(&states);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "evaluate() n'a pas abouti à temps : la connexion a probablement été rouverte au lieu d'être réutilisée",
+        );
+
+        server.join().expect("jointure thread serveur factice");
+        assert_eq!(accept_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn evaluate_reconnects_transparently_after_a_server_restart() {
+        let dir = std::env::temp_dir().join(format!("selfplay_worker_reconnect_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("création du répertoire temporaire");
+        let socket_path = dir.join("fake_infer_reconnect.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind socket factice");
+        let socket_path_str = socket_path.to_str().unwrap().to_string();
+
+        let server = std::thread::spawn(move || {
+            for i in 0..2u32 {
+                let (mut conn, _) = listener.accept().expect("accept socket factice");
+                let mut header = [0u8; 4];
+                conn.read_exact(&mut header).expect("lecture entête requête (test)");
+                let n = u32::from_le_bytes(header) as usize;
+                let mut body = vec![0u8; n * 150];
+                conn.read_exact(&mut body).expect("lecture corps requête (test)");
+                let value = i as f32 + 0.5;
+                let mut response = 1u32.to_le_bytes().to_vec();
+                response.extend_from_slice(&vec![0u8; ACTION_SPACE * 4]);
+                response.extend_from_slice(&value.to_le_bytes());
+                conn.write_all(&response).expect("écriture réponse factice");
+                // Fermeture explicite : simule un serveur qui redémarre
+                // entre deux requêtes du même worker, sans compter sur le
+                // moment exact où `Drop` fermerait le descripteur.
+                conn.shutdown(std::net::Shutdown::Both).ok();
+            }
+        });
+
+        let mut evaluator = SocketEvaluator::connect(&socket_path_str);
+        let states = vec![initial_state()];
+        let first = evaluator.evaluate(&states);
+        assert_eq!(first[0].1, 0.5);
+        let second = evaluator.evaluate(&states);
+        assert_eq!(second[0].1, 1.5);
+        server.join().expect("jointure thread serveur factice");
         let _ = std::fs::remove_file(&socket_path);
     }
 }
