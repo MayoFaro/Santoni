@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from santoni_az.network import NUM_PLANES
-from santoni_az.trainer import CHECKPOINT_RETENTION, Trainer, checkpoint_generation
+from santoni_az.trainer import CHECKPOINT_RETENTION, MAX_BUFFER_POSITIONS, Trainer, checkpoint_generation
 
 PLACEHOLDER_PLANES = [0] * (NUM_PLANES * 5 * 5)
 
@@ -53,32 +53,46 @@ def test_checkpoint_resume_preserves_generation_counter(tmp_path):
     assert resumed.consume_new_games() == 0  # mêmes parties, déjà consommées avant le crash simulé
 
 
-def test_checkpoint_resume_preserves_untrained_examples(tmp_path):
+def test_train_step_does_not_delete_examples_after_training(tmp_path):
     games_dir, checkpoint_dir = make_dirs(tmp_path)
-    # 3 moves in game 0, 2 moves in game 1 => 5 examples total.
     write_fake_game(games_dir, "game-0000.json", 1, [
         (PLACEHOLDER_PLANES, [[10, 20]]),
         (PLACEHOLDER_PLANES, [[5, 15]]),
-        (PLACEHOLDER_PLANES, [[7, 11]]),
     ])
-    write_fake_game(games_dir, "game-0001.json", -1, [
-        (PLACEHOLDER_PLANES, [[3, 10]]),
-        (PLACEHOLDER_PLANES, [[8, 4]]),
-    ])
-
     trainer = Trainer(str(games_dir), str(checkpoint_dir))
     trainer.consume_new_games()
-    total_examples = len(trainer._examples)
-    assert total_examples == 5
+    before = len(trainer._examples)
 
-    k = 2
-    assert k < total_examples
-    trainer.train_step(batch_size=k)  # trains on k examples, leaves the rest untrained
-    trainer.save_checkpoint()
+    trainer.train_step(batch_size=1)
+    trainer.train_step(batch_size=1)
+    trainer.train_step(batch_size=1)
 
-    resumed = Trainer(str(games_dir), str(checkpoint_dir))
-    resumed.load_latest_checkpoint()
-    assert len(resumed._examples) == total_examples - k
+    assert len(trainer._examples) == before
+
+
+def test_train_step_handles_batch_size_larger_than_buffer(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-0000.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    trainer.consume_new_games()
+
+    loss = trainer.train_step(batch_size=64)
+
+    assert loss > 0.0
+    assert len(trainer._examples) == 1
+
+
+def test_consume_new_games_evicts_oldest_positions_beyond_the_buffer_cap(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    trainer = Trainer(str(games_dir), str(checkpoint_dir), max_buffer_positions=1)
+    write_fake_game(games_dir, "game-0000.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+    trainer.consume_new_games()
+    assert [v for _, _, v in trainer._examples] == [1.0]
+
+    write_fake_game(games_dir, "game-0001.json", -1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+    trainer.consume_new_games()
+
+    assert [v for _, _, v in trainer._examples] == [-1.0]
 
 
 def test_load_latest_checkpoint_selects_the_highest_generation_numerically(tmp_path):

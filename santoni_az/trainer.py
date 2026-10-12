@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 from pathlib import Path
 
@@ -22,6 +23,21 @@ from .network import PolicyValueNet, ACTION_SPACE, NUM_PLANES
 # disque constante au lieu de linéaire dans le temps.
 CHECKPOINT_RETENTION = 5
 
+# Fenêtre glissante du tampon de rejeu, en nombre de *positions* (pas de
+# parties) : ~5000 parties récentes à la moyenne mesurée de 14,8
+# positions/partie sur le premier run réel (mémoire
+# santoni-mcts-az-no-power-chantier, 2026-10-11, checkpoint gen-5765).
+# Approximation volontaire par comptage de positions plutôt que de parties
+# exactes : c'est le nombre de positions qui compte pour la mémoire et
+# l'échantillonnage, suivre des frontières de parties exactes n'apporterait
+# rien ici. Avant ce correctif, `train_step` supprimait chaque exemple après
+# un seul pas de gradient (jamais revu) — un mauvais régime pour une cible
+# de valeur intrinsèquement bruitée (l'issue d'une seule partie) : diagnostic
+# empirique sur `gen-5765.pt` montrant une tête de valeur au niveau du
+# hasard (53,3% de concordance de signe, contre 54,4% pour un réseau non
+# entraîné) malgré une confiance extrême.
+MAX_BUFFER_POSITIONS = 74_000
+
 _GENERATION_PATTERN = re.compile(r'^gen-(\d+)\.pt$')
 
 
@@ -33,14 +49,36 @@ def checkpoint_generation(path):
 
 
 class Trainer:
-    def __init__(self, games_dir, checkpoint_dir, net_factory=lambda: PolicyValueNet()):
+    def __init__(self, games_dir, checkpoint_dir, net_factory=lambda: PolicyValueNet(),
+                 max_buffer_positions=MAX_BUFFER_POSITIONS):
         self.games_dir = Path(games_dir)
         self.checkpoint_dir = Path(checkpoint_dir)
         self.net = net_factory()
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=1e-3)
         self.generation = 0
+        self.max_buffer_positions = max_buffer_positions
         self._consumed_games = set()
-        self._examples = []  # (planes_placeholder, policy_target, value_target)
+        self._examples = []  # (planes, policy_target, value_target)
+
+    @staticmethod
+    def _decode_position(position, ply, outcome):
+        """Décode une position d'un `GameRecord` (`mcts_io.rs`) en exemple
+        d'entraînement. Partagée entre `consume_new_games` et la
+        reconstruction du tampon au démarrage (Task 2) : une seule
+        implémentation de la convention de signe par ply, jamais dupliquée."""
+        planes = torch.tensor(position["planes"], dtype=torch.float32).view(NUM_PLANES, 5, 5)
+        total_visits = sum(visits for _, visits in position["visits"])
+        policy_target = torch.zeros(ACTION_SPACE)
+        for action_idx, visits in position["visits"]:
+            policy_target[action_idx] = visits / total_visits
+        # Alternance stricte joueur 0 / joueur 1 à chaque ply : vraie pour
+        # toute la partie dans le sous-jeu sans pouvoir, où `is_in_scope`
+        # (native_engine/src/mcts.rs) impose `powers == [0, 0]` sur toute
+        # position rencontrée. `outcome` est fixé du point de vue du
+        # joueur 0 (cf. `play_one_game`) ; ce signe le reprojette depuis le
+        # point de vue du joueur réellement au trait à ce ply.
+        value_target = outcome if ply % 2 == 0 else -outcome
+        return planes, policy_target, float(value_target)
 
     def consume_new_games(self):
         new_files = sorted(
@@ -50,29 +88,17 @@ class Trainer:
             data = json.loads(f.read_text())
             outcome = data["outcome"]
             for ply, position in enumerate(data["positions"]):
-                planes = torch.tensor(position["planes"], dtype=torch.float32).view(NUM_PLANES, 5, 5)
-                total_visits = sum(visits for _, visits in position["visits"])
-                policy_target = torch.zeros(ACTION_SPACE)
-                for action_idx, visits in position["visits"]:
-                    policy_target[action_idx] = visits / total_visits
-                # Alternance stricte joueur 0 / joueur 1 à chaque ply : vraie
-                # pour toute la partie dans le sous-jeu sans pouvoir, où
-                # `is_in_scope` (native_engine/src/mcts.rs) impose
-                # `powers == [0, 0]` sur toute position rencontrée — aucun
-                # pouvoir ne peut donc jamais accorder de tour supplémentaire.
-                # `outcome` est fixé du point de vue du joueur 0 (cf.
-                # `play_one_game`) ; ce signe le reprojette depuis le point de
-                # vue du joueur réellement au trait à ce ply, celui encodé
-                # dans `position["planes"]`.
-                value_target = outcome if ply % 2 == 0 else -outcome
-                self._examples.append((planes, policy_target, float(value_target)))
+                self._examples.append(self._decode_position(position, ply, outcome))
             self._consumed_games.add(f.name)
+        excess = len(self._examples) - self.max_buffer_positions
+        if excess > 0:
+            del self._examples[:excess]
         return len(new_files)
 
     def train_step(self, batch_size=64):
         if not self._examples:
             return 0.0
-        batch = self._examples[:batch_size]
+        batch = random.sample(self._examples, min(batch_size, len(self._examples)))
         planes = torch.stack([p for p, _, _ in batch])
         policy_targets = torch.stack([pt for _, pt, _ in batch])
         value_targets = torch.tensor([vt for _, _, vt in batch]).unsqueeze(1)
@@ -83,7 +109,6 @@ class Trainer:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        del self._examples[:len(batch)]
         return float(loss.item())
 
     def save_checkpoint(self):
