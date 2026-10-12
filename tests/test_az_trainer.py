@@ -96,6 +96,50 @@ def test_consume_new_games_evicts_oldest_positions_beyond_the_buffer_cap(tmp_pat
     assert [v for _, _, v in trainer._examples] == [-1.0]
 
 
+def test_consume_new_games_skips_unreadable_game_files(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    (games_dir / "game-bad.json").write_text("")  # fichier corrompu/vide
+    write_fake_game(games_dir, "game-good.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    count = trainer.consume_new_games()
+
+    assert count == 2
+    assert len(trainer._examples) == 1
+    # Le fichier illisible reste marqué consommé : jamais retenté.
+    assert trainer.consume_new_games() == 0
+
+
+def test_load_latest_checkpoint_skips_unreadable_game_files_during_rebuild(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    (games_dir / "game-bad.json").write_text("")
+    write_fake_game(games_dir, "game-good.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    generation = trainer.load_latest_checkpoint()
+
+    assert generation == 0
+    assert [v for _, _, v in trainer._examples] == [1.0]
+    assert trainer.consume_new_games() == 0
+
+
+def test_load_latest_checkpoint_rebuilds_buffer_in_chronological_order_after_trimming(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-b.json", 1, [
+        (PLACEHOLDER_PLANES, [[210, 1]]),
+        (PLACEHOLDER_PLANES, [[211, 1]]),
+    ])
+    os.utime(games_dir / "game-b.json", (2000, 2000))
+    write_fake_game(games_dir, "game-c.json", 1, [(PLACEHOLDER_PLANES, [[300, 1]])])
+    os.utime(games_dir / "game-c.json", (3000, 3000))
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir), max_buffer_positions=2)
+    trainer.load_latest_checkpoint()
+
+    hot_actions = [policy.argmax().item() for _, policy, _ in trainer._examples]
+    assert hot_actions == [211, 300]
+
+
 def test_load_latest_checkpoint_rebuilds_buffer_only_from_most_recent_games(tmp_path):
     games_dir, checkpoint_dir = make_dirs(tmp_path)
     write_fake_game(games_dir, "game-old.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])

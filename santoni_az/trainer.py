@@ -85,7 +85,15 @@ class Trainer:
             f for f in self.games_dir.glob("game-*.json") if f.name not in self._consumed_games
         )
         for f in new_files:
-            data = json.loads(f.read_text())
+            try:
+                data = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                # Fichier corrompu ou vide (ex. écrit sans fsync avant le
+                # renommage atomique, cf. `mcts_io::write_game_atomically`,
+                # et coupure de courant) : marqué consommé pour ne jamais
+                # être retenté, mais aucun exemple n'en est tiré.
+                self._consumed_games.add(f.name)
+                continue
             outcome = data["outcome"]
             for ply, position in enumerate(data["positions"]):
                 self._examples.append(self._decode_position(position, ply, outcome))
@@ -201,7 +209,12 @@ class Trainer:
         for f in all_files:
             self._consumed_games.add(f.name)
             if total < self.max_buffer_positions:
-                data = json.loads(f.read_text())
+                try:
+                    data = json.loads(f.read_text())
+                except (json.JSONDecodeError, OSError):
+                    # Même raison que dans `consume_new_games` : un fichier
+                    # corrompu ou vide ne doit pas bloquer tout redémarrage.
+                    continue
                 kept_in_order.append(data)
                 total += len(data["positions"])
         for data in reversed(kept_in_order):
