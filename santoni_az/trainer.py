@@ -119,8 +119,6 @@ class Trainer:
             "generation": self.generation,
             "model_state": self.net.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
-            "consumed_games": sorted(self._consumed_games),
-            "examples": self._examples,
         }, tmp)
         os.replace(tmp, path)
         self._prune_checkpoints()
@@ -163,13 +161,53 @@ class Trainer:
                       for path in self.checkpoint_dir.glob("gen-*.pt")
                       for generation in [checkpoint_generation(path)]
                       if generation is not None]
-        if not candidates:
-            return 0
-        latest = max(candidates, key=lambda item: item[0])[1]
-        data = torch.load(latest, weights_only=False)
-        self.net.load_state_dict(data["model_state"])
-        self.optimizer.load_state_dict(data["optimizer_state"])
-        self.generation = data["generation"]
-        self._consumed_games = set(data["consumed_games"])
-        self._examples = data["examples"]
+        if candidates:
+            latest = max(candidates, key=lambda item: item[0])[1]
+            data = torch.load(latest, weights_only=False)
+            self.net.load_state_dict(data["model_state"])
+            self.optimizer.load_state_dict(data["optimizer_state"])
+            self.generation = data["generation"]
+        # Le tampon n'est jamais sérialisé dans le checkpoint (voir
+        # `_rebuild_buffer_from_disk`) : il se reconstruit toujours depuis
+        # les fichiers de parties sur disque, qu'un checkpoint modèle ait
+        # été trouvé ci-dessus ou non.
+        self._rebuild_buffer_from_disk()
         return self.generation
+
+    def _rebuild_buffer_from_disk(self):
+        """Reconstruit `_examples`/`_consumed_games` depuis les fichiers de
+        parties déjà sur disque, jamais depuis le checkpoint (qui ne les
+        contient plus) -- ils restent la seule source de vérité durable
+        pour les données d'entraînement (§3.2 du spec
+        2026-10-11-trainer-replay-buffer-design.md). Les noms de fichiers
+        (`game-{pid}-{:06}.json`) ne sont pas triables chronologiquement
+        entre workers distincts (chaque worker a son propre compteur
+        local, cf. `selfplay_worker.rs::main`) : on trie par date de
+        modification. Tous les fichiers trouvés sont marqués consommés,
+        même ceux dont le contenu n'est pas chargé dans le tampon, sinon un
+        futur `consume_new_games()` réingérerait tout l'historique plus
+        ancien que la fenêtre dès le prochain appel. Ne lit le *contenu*
+        que des fichiers retenus dans la fenêtre -- le temps de démarrage
+        reste borné indépendamment de la taille totale du corpus déjà
+        accumulé.
+        """
+        self._examples = []
+        self._consumed_games = set()
+        all_files = sorted(
+            self.games_dir.glob("game-*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        kept_in_order = []
+        total = 0
+        for f in all_files:
+            self._consumed_games.add(f.name)
+            if total < self.max_buffer_positions:
+                data = json.loads(f.read_text())
+                kept_in_order.append(data)
+                total += len(data["positions"])
+        for data in reversed(kept_in_order):
+            outcome = data["outcome"]
+            for ply, position in enumerate(data["positions"]):
+                self._examples.append(self._decode_position(position, ply, outcome))
+        excess = len(self._examples) - self.max_buffer_positions
+        if excess > 0:
+            del self._examples[:excess]

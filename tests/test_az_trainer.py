@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,60 @@ def test_consume_new_games_evicts_oldest_positions_beyond_the_buffer_cap(tmp_pat
     trainer.consume_new_games()
 
     assert [v for _, _, v in trainer._examples] == [-1.0]
+
+
+def test_load_latest_checkpoint_rebuilds_buffer_only_from_most_recent_games(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-old.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+    os.utime(games_dir / "game-old.json", (1000, 1000))
+    write_fake_game(games_dir, "game-new.json", -1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir), max_buffer_positions=1)
+    trainer.save_checkpoint()
+
+    resumed = Trainer(str(games_dir), str(checkpoint_dir), max_buffer_positions=1)
+    resumed.load_latest_checkpoint()
+
+    assert [v for _, _, v in resumed._examples] == [-1.0]
+    # Les deux fichiers, y compris le plus ancien jamais chargé dans le
+    # tampon, doivent être marqués consommés -- sinon le prochain appel
+    # réingérerait tout l'historique plus ancien que la fenêtre.
+    assert resumed.consume_new_games() == 0
+
+
+def test_load_latest_checkpoint_rebuilds_buffer_even_without_a_checkpoint_file(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-0000.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    generation = trainer.load_latest_checkpoint()
+
+    assert generation == 0
+    assert len(trainer._examples) == 1
+    assert trainer.consume_new_games() == 0
+
+
+def test_load_latest_checkpoint_handles_no_games_on_disk_yet(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+
+    generation = trainer.load_latest_checkpoint()
+
+    assert generation == 0
+    assert trainer._examples == []
+
+
+def test_save_checkpoint_no_longer_persists_examples_or_consumed_games(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-0000.json", 1, [(PLACEHOLDER_PLANES, [[0, 1]])])
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    trainer.consume_new_games()
+
+    path = trainer.save_checkpoint()
+    saved = torch.load(path, weights_only=False)
+
+    assert "examples" not in saved
+    assert "consumed_games" not in saved
 
 
 def test_load_latest_checkpoint_selects_the_highest_generation_numerically(tmp_path):
