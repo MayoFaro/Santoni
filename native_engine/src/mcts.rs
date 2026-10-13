@@ -125,6 +125,17 @@ pub fn action_index(move_action: &Action, build_action: &Action, worker_slot: us
 }
 
 pub trait LeafEvaluator {
+    /// Évalue un lot de positions de feuille, renvoyant pour chacune un vecteur
+    /// de logits (priors) et une valeur scalaire. **Contrat d'ordre crucial** :
+    /// les résultats renvoyés doivent être dans le **même ordre** que les états
+    /// d'entrée — le i-ème élément du retour correspond au i-ème état du slice
+    /// `states`. Cet ordre est maintenant correctness-critical depuis que `Mcts::run`
+    /// batch-évalue plusieurs feuilles en un seul appel (avant restructuration,
+    /// `evaluate` n'était jamais appelé qu'avec un seul état, rendant l'ordre
+    /// implicite). Les implémentations doivent respecter rigoureusement cet ordre :
+    /// toute violation silencieuse sans test détectant le désordre causera des
+    /// backups de valeurs sur les mauvais chemins et une destruction silencieuse
+    /// de la qualité du jeu.
     fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)>;
 }
 
