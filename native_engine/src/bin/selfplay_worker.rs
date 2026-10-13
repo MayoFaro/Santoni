@@ -153,6 +153,17 @@ const DIRICHLET_ALPHA: f32 = 0.3;
 const DIRICHLET_EPSILON: f32 = 0.25;
 const TEMPERATURE_PLIES: usize = 6;
 
+/// Nombre de feuilles regroupées en un seul appel réseau par vague de
+/// sélection MCTS (`Mcts::run`, native_engine/src/mcts.rs) — réduit le
+/// nombre d'allers-retours avec le serveur d'inférence par coup joué (à
+/// `simulations_per_move = 32`, 4 vagues au lieu de 32 appels séparés).
+/// S'applique au self-play (`play_one_game`) et à l'arbitrage
+/// (`run_single_move`) : le regroupement de feuilles est une technique de
+/// performance pure, pas une source de bruit, donc les deux chemins en
+/// bénéficient également — contrairement au bruit de Dirichlet et à la
+/// température d'ouverture ci-dessus, qui restent self-play uniquement.
+const LEAF_BATCH_SIZE: usize = 8;
+
 /// Générateur xorshift64* minimal (aucune dépendance externe — règle du
 /// projet). N'a pas besoin d'être cryptographiquement sûr : seul le service
 /// rendu est de casser le déterminisme entre parties/process, pas une
@@ -283,7 +294,7 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, r
         let n_edges = mcts.visit_counts().len();
         let noise = dirichlet_noise(&mut rng, n_edges, DIRICHLET_ALPHA);
         mcts.mix_root_noise(&noise, DIRICHLET_EPSILON);
-        mcts.run(simulations_per_move, evaluator);
+        mcts.run(simulations_per_move, LEAF_BATCH_SIZE, evaluator);
         // `visit_counts()` porte directement l'état résultant (`after`) de
         // chaque coup légal : pas de second appel à `legal_children` dont
         // l'ordre devrait, par convention non vérifiée par le compilateur,
@@ -392,7 +403,7 @@ fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, e
     let mut mcts = Mcts::new(state, 1.5);
     const BATCH: u32 = 16;
     loop {
-        mcts.run(BATCH, evaluator);
+        mcts.run(BATCH, LEAF_BATCH_SIZE, evaluator);
         if Instant::now() >= deadline {
             break;
         }
