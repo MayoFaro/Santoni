@@ -135,7 +135,10 @@ pub trait LeafEvaluator {
     /// implicite). Les implémentations doivent respecter rigoureusement cet ordre :
     /// toute violation silencieuse sans test détectant le désordre causera des
     /// backups de valeurs sur les mauvais chemins et une destruction silencieuse
-    /// de la qualité du jeu.
+    /// de la qualité du jeu. **Contrat de longueur tout aussi strict** : le
+    /// `Vec` renvoyé doit avoir exactement une entrée par état d'entrée (même
+    /// longueur que `states`) ; `Mcts::run` vérifie cette invariante par un
+    /// `assert_eq!` avant de consommer le résultat.
     fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)>;
 }
 
@@ -202,6 +205,11 @@ impl Mcts {
             if !pending.is_empty() {
                 let leaf_states: Vec<State> = pending.iter().map(|(_, s)| *s).collect();
                 let results = evaluator.evaluate(&leaf_states);
+                assert_eq!(
+                    results.len(),
+                    pending.len(),
+                    "LeafEvaluator::evaluate doit renvoyer un résultat par état en entrée"
+                );
                 for ((path, leaf_state), (priors, value)) in pending.into_iter().zip(results.into_iter()) {
                     self.expand_leaf(leaf_state, &priors);
                     self.backup_path(&path, value);
@@ -240,6 +248,18 @@ impl Mcts {
             noise.len(),
             "le bruit doit avoir une valeur par coup légal à la racine"
         );
+        // Les priors stockés dans `Edge::prior` sont les logits bruts
+        // renvoyés par `LeafEvaluator::evaluate` (cf. `expand_leaf`), pas
+        // une distribution de probabilité : un réseau non entraîné les
+        // renvoie centrés sur 0, ~moitié négatifs (mesuré en revue finale).
+        // `noise` (sortie de `dirichlet_noise`, bin/selfplay_worker.rs) est
+        // en revanche une vraie distribution sommant à 1. Mélanger les deux
+        // tels quels n'a aucune sémantique de probabilité et rend `epsilon`
+        // sans effet mesurable dès que l'échelle des logits dépasse celle du
+        // bruit — exactement le bruit "inerte" que ce mélange est censé
+        // éviter. Softmaxer les priors ici, juste avant le mélange, leur
+        // donne la même échelle que `noise` sans toucher à `run_single_move`
+        // (chemin d'arbitrage, qui n'appelle jamais `mix_root_noise`).
         let max = node.edges.iter().map(|e| e.prior).fold(f32::NEG_INFINITY, f32::max);
         let mut total = 0.0f32;
         for edge in node.edges.iter_mut() {

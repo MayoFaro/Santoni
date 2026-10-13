@@ -83,6 +83,10 @@ impl SocketEvaluator {
         let mut header = [0u8; 4];
         stream.read_exact(&mut header)?;
         let n = u32::from_le_bytes(header) as usize;
+        assert_eq!(
+            n, states.len(),
+            "le serveur d'inférence a renvoyé un nombre de résultats différent du nombre d'états envoyés"
+        );
         let item_size = ACTION_SPACE * 4 + 4;
         let mut body = vec![0u8; n * item_size];
         stream.read_exact(&mut body)?;
