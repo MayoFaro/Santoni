@@ -135,10 +135,23 @@ struct Edge {
     prior: f32,
     visits: u32,
     value_sum: f32,
+    virtual_loss: u32,
 }
 
 struct Node {
     edges: Vec<Edge>,
+}
+
+/// Résultat d'une passe de sélection (une descente racine→feuille, sans
+/// appel réseau) : soit l'état terminal rencontré a une valeur déjà connue
+/// (`Terminal`), soit la descente s'est arrêtée sur une feuille jamais vue
+/// qui doit être évaluée par le réseau (`Leaf`). Dans les deux cas,
+/// `path` porte la séquence (état, index d'arête choisie) traversée depuis
+/// la racine, nécessaire pour le backup différé une fois la vraie valeur
+/// connue.
+enum SelectOutcome {
+    Terminal { path: Vec<(State, usize)>, value: f32 },
+    Leaf { path: Vec<(State, usize)>, leaf_state: State },
 }
 
 pub struct Mcts {
@@ -152,30 +165,50 @@ impl Mcts {
         Self { root, c_puct, nodes: std::collections::HashMap::new() }
     }
 
-    pub fn run(&mut self, simulations: u32, evaluator: &mut dyn LeafEvaluator) {
+    /// Exécute `simulations` simulations MCTS, regroupées en vagues d'au
+    /// plus `leaf_batch_size` feuilles évaluées en un seul appel à
+    /// `evaluator.evaluate`. `leaf_batch_size == 1` reproduit exactement le
+    /// comportement séquentiel d'avant ce correctif (aucune perte virtuelle
+    /// n'a d'effet observable avec une seule sélection par vague) — voir
+    /// les tests de non-régression du module `mcts_tree_tests`.
+    pub fn run(&mut self, simulations: u32, leaf_batch_size: usize, evaluator: &mut dyn LeafEvaluator) {
         assert!(
             terminal_value(&self.root, self.root.player).is_none(),
             "Mcts::run appelé sur une racine déjà terminale"
         );
+        assert!(leaf_batch_size >= 1, "leaf_batch_size doit être au moins 1");
         self.ensure_root_expanded(evaluator);
-        for _ in 0..simulations {
-            self.simulate_one(self.root, evaluator);
+        let mut done = 0u32;
+        while done < simulations {
+            let wave_size = (simulations - done).min(leaf_batch_size as u32);
+            let mut pending: Vec<(Vec<(State, usize)>, State)> = Vec::new();
+            for _ in 0..wave_size {
+                match self.select_one() {
+                    SelectOutcome::Terminal { path, value } => self.backup_path(&path, value),
+                    SelectOutcome::Leaf { path, leaf_state } => pending.push((path, leaf_state)),
+                }
+            }
+            if !pending.is_empty() {
+                let leaf_states: Vec<State> = pending.iter().map(|(_, s)| *s).collect();
+                let results = evaluator.evaluate(&leaf_states);
+                for ((path, leaf_state), (priors, value)) in pending.into_iter().zip(results.into_iter()) {
+                    self.expand_leaf(leaf_state, &priors);
+                    self.backup_path(&path, value);
+                }
+            }
+            done += wave_size;
         }
     }
 
     /// Expansion initiale de la racine (évaluation + peuplement des arêtes),
-    /// idempotente : ne fait rien si déjà expansée. Ne compte pas comme une
-    /// des simulations de `run` — sans elle, la toute première itération ne
-    /// ferait qu'évaluer et peupler les arêtes de la racine sans jamais
-    /// descendre ni backuper sur l'une d'elles (aucun parent au-dessus de la
-    /// racine pour recevoir ce backup) — `visit_counts` totaliserait alors
-    /// `simulations - 1`. Extraite de `run` (plutôt qu'inlinée comme avant)
-    /// pour que l'appelant self-play puisse injecter du bruit de Dirichlet
+    /// idempotente : ne fait rien si déjà expansée. Extraite de `run` pour
+    /// que l'appelant self-play puisse injecter du bruit de Dirichlet
     /// (`mix_root_noise`) entre l'expansion et le reste des simulations ;
     /// l'appeler directement est un no-op si `run` l'a déjà fait.
     pub fn ensure_root_expanded(&mut self, evaluator: &mut dyn LeafEvaluator) {
         if !self.nodes.contains_key(&self.root) {
-            self.simulate_one(self.root, evaluator);
+            let (priors, _value) = evaluator.evaluate(&[self.root]).remove(0);
+            self.expand_leaf(self.root, &priors);
         }
     }
 
@@ -196,18 +229,6 @@ impl Mcts {
             noise.len(),
             "le bruit doit avoir une valeur par coup légal à la racine"
         );
-        // Les priors stockés dans `Edge::prior` sont les logits bruts
-        // renvoyés par `LeafEvaluator::evaluate` (cf. `simulate_one`), pas
-        // une distribution de probabilité : un réseau non entraîné les
-        // renvoie centrés sur 0, ~moitié négatifs (mesuré en revue finale).
-        // `noise` (sortie de `dirichlet_noise`, bin/selfplay_worker.rs) est
-        // en revanche une vraie distribution sommant à 1. Mélanger les deux
-        // tels quels n'a aucune sémantique de probabilité et rend `epsilon`
-        // sans effet mesurable dès que l'échelle des logits dépasse celle du
-        // bruit — exactement le bruit "inerte" que ce mélange est censé
-        // éviter. Softmaxer les priors ici, juste avant le mélange, leur
-        // donne la même échelle que `noise` sans toucher à `run_single_move`
-        // (chemin d'arbitrage, qui n'appelle jamais `mix_root_noise`).
         let max = node.edges.iter().map(|e| e.prior).fold(f32::NEG_INFINITY, f32::max);
         let mut total = 0.0f32;
         for edge in node.edges.iter_mut() {
@@ -219,62 +240,88 @@ impl Mcts {
         }
     }
 
-    /// Retourne la valeur de `state` du point de vue du joueur au trait à
-    /// cet état (convention négamax : chaque niveau de récursion inverse la
-    /// valeur renvoyée par l'enfant avant de l'utiliser).
-    fn simulate_one(&mut self, state: State, evaluator: &mut dyn LeafEvaluator) -> f32 {
+    /// Une passe de sélection : descend depuis la racine via UCB (en tenant
+    /// compte de la perte virtuelle posée par les sélections précédentes de
+    /// la même vague), sans jamais appeler le réseau. S'arrête sur un état
+    /// terminal (valeur déjà connue) ou sur une feuille jamais vue (à
+    /// évaluer par lot). Pose une perte virtuelle d'une unité sur chaque
+    /// arête traversée ; `backup_path` l'annule.
+    fn select_one(&mut self) -> SelectOutcome {
+        let mut path: Vec<(State, usize)> = Vec::new();
+        let mut state = self.root;
+        loop {
+            let to_move = state.player;
+            if let Some(v) = terminal_value(&state, to_move) {
+                return SelectOutcome::Terminal { path, value: v as f32 };
+            }
+            if !self.nodes.contains_key(&state) {
+                return SelectOutcome::Leaf { path, leaf_state: state };
+            }
+            let c_puct = self.c_puct;
+            let node = self.nodes.get_mut(&state).unwrap();
+            let total_effective: u32 =
+                node.edges.iter().map(|e| e.visits + e.virtual_loss).sum::<u32>().max(1);
+            let sqrt_total = (total_effective as f32).sqrt();
+            let score = |e: &Edge| {
+                let q = if e.visits == 0 { 0.0 } else { e.value_sum / e.visits as f32 };
+                q + c_puct * e.prior * sqrt_total / (1.0 + e.visits as f32 + e.virtual_loss as f32)
+            };
+            let best = node
+                .edges
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| score(a).partial_cmp(&score(b)).unwrap())
+                .map(|(i, _)| i)
+                .expect("un noeud non terminal expansé a au moins un coup légal");
+            node.edges[best].virtual_loss += 1;
+            let next_state = node.edges[best].after;
+            path.push((state, best));
+            state = next_state;
+        }
+    }
+
+    /// Crée le noeud d'une feuille nouvellement évaluée : une arête par
+    /// coup légal, avec son prior tiré de `priors` à l'index
+    /// `action_index`. Ne fait aucun backup — appelé juste avant
+    /// `backup_path` par `run`/`ensure_root_expanded`.
+    fn expand_leaf(&mut self, state: State, priors: &[f32]) {
         let to_move = state.player;
-        if let Some(v) = terminal_value(&state, to_move) {
-            return v as f32;
+        let children = legal_children(&state);
+        let edges = children
+            .into_iter()
+            .map(|(mv, bld, after)| {
+                let worker_slot = state.workers[to_move as usize]
+                    .iter()
+                    .position(|&c| c == mv.source)
+                    .expect("le coup joué doit déplacer un bâtisseur du joueur au trait");
+                let idx = action_index(&mv, &bld, worker_slot);
+                Edge { mv, bld, after, prior: priors[idx], visits: 0, value_sum: 0.0, virtual_loss: 0 }
+            })
+            .collect();
+        self.nodes.insert(state, Node { edges });
+    }
+
+    /// Remonte `path` (de la feuille vers la racine) en annulant la perte
+    /// virtuelle posée par `select_one` et en appliquant la vraie valeur,
+    /// inversée à chaque niveau (convention négamax — `leaf_value` est la
+    /// valeur du point de vue du joueur au trait à la feuille/l'état
+    /// terminal, exactement ce que renvoient `LeafEvaluator::evaluate` et
+    /// `terminal_value`).
+    fn backup_path(&mut self, path: &[(State, usize)], leaf_value: f32) {
+        let mut value = -leaf_value;
+        for &(state, edge_idx) in path.iter().rev() {
+            let node = self.nodes.get_mut(&state).unwrap();
+            let edge = &mut node.edges[edge_idx];
+            edge.virtual_loss -= 1;
+            edge.visits += 1;
+            edge.value_sum += value;
+            value = -value;
         }
-        if !self.nodes.contains_key(&state) {
-            let children = legal_children(&state);
-            let (priors, value) = evaluator.evaluate(&[state]).remove(0);
-            let edges = children
-                .into_iter()
-                .map(|(mv, bld, after)| {
-                    let worker_slot = state.workers[to_move as usize]
-                        .iter()
-                        .position(|&c| c == mv.source)
-                        .expect("le coup joué doit déplacer un bâtisseur du joueur au trait");
-                    let idx = action_index(&mv, &bld, worker_slot);
-                    Edge { mv, bld, after, prior: priors[idx], visits: 0, value_sum: 0.0 }
-                })
-                .collect();
-            self.nodes.insert(state, Node { edges });
-            return value;
-        }
-        let c_puct = self.c_puct;
-        let node = self.nodes.get(&state).unwrap();
-        let total_visits: u32 = node.edges.iter().map(|e| e.visits).sum::<u32>().max(1);
-        let sqrt_total = (total_visits as f32).sqrt();
-        let score = |e: &Edge| {
-            let q = if e.visits == 0 { 0.0 } else { e.value_sum / e.visits as f32 };
-            q + c_puct * e.prior * sqrt_total / (1.0 + e.visits as f32)
-        };
-        let best = node
-            .edges
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| score(a).partial_cmp(&score(b)).unwrap())
-            .map(|(i, _)| i)
-            .expect("un noeud non terminal expansé a au moins un coup légal");
-        let next_state = node.edges[best].after;
-        let value = -self.simulate_one(next_state, evaluator);
-        let node = self.nodes.get_mut(&state).unwrap();
-        node.edges[best].visits += 1;
-        node.edges[best].value_sum += value;
-        value
     }
 
     /// Coups légaux à la racine avec leur nombre de visites et l'état
     /// résultant, pour construire la cible de politique de l'entraînement
-    /// et avancer la partie sans recalculer `legal_children` séparément —
-    /// un second appel recomputant les mêmes coups légaux dans un ordre
-    /// supposé identique est exactement le genre de couplage non vérifié
-    /// qu'une revue a signalé (ordre de `visit_counts` vs `legal_children`
-    /// jamais garanti égal par le système de types) ; porter `after` ici
-    /// l'élimine par construction plutôt que par convention.
+    /// et avancer la partie sans recalculer `legal_children` séparément.
     pub fn visit_counts(&self) -> Vec<(Action, Action, State, u32)> {
         self.nodes[&self.root]
             .edges
@@ -405,7 +452,7 @@ mod mcts_tree_tests {
         let s = state_with_immediate_win();
         let mut mcts = Mcts::new(s, 1.5);
         let mut eval = UniformEvaluator;
-        mcts.run(50, &mut eval);
+        mcts.run(50, 1, &mut eval);
         let counts = mcts.visit_counts();
         let total: u32 = counts.iter().map(|(_, _, _, n)| n).sum();
         assert_eq!(total, 50);
@@ -465,7 +512,7 @@ mod mcts_tree_tests {
         let mut noise = vec![0.0f32; n_edges];
         noise[0] = 1.0;
         mcts.mix_root_noise(&noise, 1.0);
-        mcts.run(200, &mut eval);
+        mcts.run(200, 1, &mut eval);
         let counts = mcts.visit_counts();
         let noised_visits = counts[0].3;
         assert!(
@@ -524,7 +571,7 @@ mod mcts_tree_tests {
         // elle reste activement repoussée par le terme d'exploration UCB.
         noise[0] = 1.0;
         mcts.mix_root_noise(&noise, 0.25); // DIRICHLET_EPSILON (bin/selfplay_worker.rs)
-        mcts.run(400, &mut eval);
+        mcts.run(400, 1, &mut eval);
         let counts = mcts.visit_counts();
         let noised_visits = counts[0].3;
         let max_other = counts.iter().skip(1).map(|(_, _, _, n)| *n).max().unwrap();
@@ -551,5 +598,52 @@ mod mcts_tree_tests {
             assert_eq!(cbld, lbld);
             assert_eq!(cafter, lafter);
         }
+    }
+
+    #[test]
+    fn run_produces_exactly_simulations_total_visits_with_batching() {
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = UniformEvaluator;
+        mcts.run(37, 8, &mut eval); // 37 n'est pas un multiple de 8
+        let counts = mcts.visit_counts();
+        let total: u32 = counts.iter().map(|(_, _, _, n)| n).sum();
+        assert_eq!(total, 37);
+    }
+
+    #[test]
+    fn forced_move_with_batching_does_not_panic() {
+        let s = state_with_immediate_win(); // une seule arête légale
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = UniformEvaluator;
+        mcts.run(50, 8, &mut eval);
+        let counts = mcts.visit_counts();
+        let total: u32 = counts.iter().map(|(_, _, _, n)| n).sum();
+        assert_eq!(total, 50);
+    }
+
+    struct RecordingEvaluator {
+        call_sizes: Vec<usize>,
+    }
+    impl LeafEvaluator for RecordingEvaluator {
+        fn evaluate(&mut self, states: &[State]) -> Vec<(Vec<f32>, f32)> {
+            self.call_sizes.push(states.len());
+            states.iter().map(|_| (vec![1.0 / ACTION_SPACE as f32; ACTION_SPACE], 0.0)).collect()
+        }
+    }
+
+    #[test]
+    fn run_batches_multiple_leaves_into_a_single_evaluate_call() {
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = RecordingEvaluator { call_sizes: Vec::new() };
+        mcts.run(64, 8, &mut eval);
+        assert!(
+            eval.call_sizes.iter().any(|&n| n > 1),
+            "au moins un appel à evaluate() doit recevoir plusieurs états à la fois, trouvé {:?}",
+            eval.call_sizes
+        );
     }
 }
