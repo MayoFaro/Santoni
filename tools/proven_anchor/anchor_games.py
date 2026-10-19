@@ -4,11 +4,15 @@ position with a provable forced win at an exact ply distance.
 `scan_game_for_forced_win` walks a game's position history and asks the
 reference engine's own proof search (`santorini.native.native_search`,
 imported at module level so tests can `monkeypatch.setattr(mod,
-"native_search", ...)`) whether any position is a proven forced win at
-exactly `target_distance` plies -- `mate_distance`
-(`tools.proven_anchor.verdicts`) turns a proof into that ply count. The
-first qualifying index is returned, or `None` if no position in the game
-qualifies within the given per-call `seconds` budget.
+"native_search", ...)`) whether any position is a proven forced **win**
+for the player to move at exactly `target_distance` plies. The sign of
+`analysis.score` is checked directly rather than through
+`tools.proven_anchor.verdicts.mate_distance`, which is `MATE -
+abs(analysis.score)` and therefore sign-blind: a forced *loss* in six
+scores `-(MATE - 6)` and would be indistinguishable from the forced win in
+six that spec section 3.1 actually requires. The first qualifying index is
+returned, or `None` if no position in the game qualifies within the given
+per-call `seconds` budget.
 
 `play_reference_vs_reference` generates one such game: the frozen reference
 engine plays both sides (mirrors the loop shape of
@@ -31,18 +35,27 @@ from __future__ import annotations
 from santorini.engine import Position, terminal_position, validate_setup
 from santorini.native import native_search
 
+from santorini.search import MATE
+
 from tools.mcts_az_vs_reference_campaign import reference_move
-from tools.proven_anchor.verdicts import mate_distance
 
 MAX_PLIES = 150
 
 
 def scan_game_for_forced_win(positions: list[Position], target_distance: int, seconds: float) -> int | None:
-    """First index in `positions` that is a proven forced win in exactly
-    `target_distance` plies, or `None` if none is."""
+    """First index in `positions` whose player to move has a proven forced
+    **win** in exactly `target_distance` plies, or `None` if none has.
+
+    `analysis.score` is signed from `position.player`'s own perspective
+    (see `tools.proven_anchor.verdicts`' module docstring), so a positive
+    score is the required forced win and a negative one is a forced loss --
+    which must *not* qualify, hence the explicit sign test instead of
+    `mate_distance`'s `MATE - abs(score)`."""
     for index, position in enumerate(positions):
         analysis = native_search(position, seconds)
-        if mate_distance(analysis) == target_distance:
+        if not analysis.proven or analysis.score <= 0:
+            continue
+        if MATE - analysis.score == target_distance:
             return index
     return None
 
@@ -80,12 +93,22 @@ def find_anchor_games(openings: list[dict], target_distance: int, seconds: float
     openings are never played out. Raises `ValueError` if `openings` is
     exhausted first: silently proceeding with fewer than `minimum` anchors
     would undermine whatever downstream curriculum depends on having them,
-    so this fails loudly instead."""
+    so this fails loudly instead.
+
+    A game whose qualifying position is *identical* to an already-accepted
+    anchor's is rejected: two such anchors would give the curriculum the
+    same ancestor twice under two names, so one game's held-out children
+    would be the other game's own training material. Near-identical (as
+    opposed to equal) qualifying positions are not detected here -- they
+    are caught downstream instead, by the orchestrator excluding every
+    position it has trained on from every held-out pool."""
     found: list[tuple[list[Position], int]] = []
+    qualifying_positions: set[Position] = set()
     for opening_job in openings:
         positions = play_reference_vs_reference(opening_job, seconds, reference_binary)
         index = scan_game_for_forced_win(positions, target_distance, seconds)
-        if index is not None:
+        if index is not None and positions[index] not in qualifying_positions:
+            qualifying_positions.add(positions[index])
             found.append((positions, index))
             if len(found) >= minimum:
                 return found

@@ -43,6 +43,65 @@ def test_scan_game_for_forced_win_returns_none_when_absent(monkeypatch):
     assert scan_game_for_forced_win(positions, target_distance=6, seconds=0.1) is None
 
 
+def test_scan_game_for_forced_win_rejects_a_proven_loss_at_the_target_distance(monkeypatch):
+    """A forced *loss* in N scores `-(MATE - N)`, which `MATE - abs(score)`
+    cannot tell apart from a forced win in N. Spec Sec 3.1 requires an
+    anchor position whose player to move *wins*, so a proven loss at the
+    same distance must not qualify."""
+    import tools.proven_anchor.anchor_games as mod
+
+    positions = [Position(workers=((0, 4), (20, 24))) for _ in range(3)]
+
+    def losing_proof(position, seconds):
+        class FakeAnalysis:
+            proven = True
+            score = -(100_000 - 6)  # forced loss in 6 for the player to move
+        return FakeAnalysis()
+
+    monkeypatch.setattr(mod, "native_search", losing_proof)
+
+    assert scan_game_for_forced_win(positions, target_distance=6, seconds=0.1) is None
+
+
+def test_scan_game_for_forced_win_accepts_a_proven_win_at_the_target_distance(monkeypatch):
+    import tools.proven_anchor.anchor_games as mod
+
+    positions = [Position(workers=((0, 4), (20, 24))) for _ in range(3)]
+
+    def winning_proof(position, seconds):
+        class FakeAnalysis:
+            proven = True
+            score = 100_000 - 6
+        return FakeAnalysis()
+
+    monkeypatch.setattr(mod, "native_search", winning_proof)
+
+    assert scan_game_for_forced_win(positions, target_distance=6, seconds=0.1) == 0
+
+
+def test_find_anchor_games_rejects_a_second_game_with_an_identical_qualifying_position(monkeypatch):
+    """Plan Review Focus: two anchor games whose scanned positions turn out
+    identical would hand the curriculum the same ancestor twice under two
+    names, so one game's "held-out" children would be the other's own
+    training material."""
+    import tools.proven_anchor.anchor_games as mod
+
+    histories = {
+        0: ['shared-qualifying-position'],
+        1: ['shared-qualifying-position'],  # same position, different opening
+        2: ['genuinely-different-position'],
+    }
+    monkeypatch.setattr(mod, 'play_reference_vs_reference',
+                        lambda job, seconds, binary: histories[job['id']])
+    monkeypatch.setattr(mod, 'scan_game_for_forced_win', lambda positions, d, s: 0)
+
+    result = find_anchor_games([{'id': i} for i in range(3)], target_distance=2,
+                                seconds=0.1, reference_binary='unused', minimum=2)
+
+    assert result == [(['shared-qualifying-position'], 0),
+                      (['genuinely-different-position'], 0)]
+
+
 def boxed_in_position(stuck_player):
     """Position of the no-power subgame where `stuck_player` has no legal
     move at all: both their workers sit at (12, 13), surrounded by domes on

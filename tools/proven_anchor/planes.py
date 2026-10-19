@@ -18,6 +18,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +29,15 @@ sys.path.insert(0, str(ROOT))
 from santorini.native import encode  # noqa: E402
 
 
+@lru_cache(maxsize=8192)
 def compute_planes(position: "santorini.engine.Position") -> bytes:
+    """Raw `encode_planes` bytes for `position`.
+
+    Memoized: `Position` is a frozen (hashable) dataclass and the returned
+    `bytes` are immutable, so sharing one result across callers is safe --
+    and worth it, since every call here costs a process spawn and the
+    validation gate re-encodes the same held-out positions once per round
+    per network, every round."""
     state = encode(position)
     with tempfile.TemporaryDirectory() as scratch:
         scratch_dir = Path(scratch)
