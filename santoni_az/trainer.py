@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 from pathlib import Path
 
@@ -22,6 +23,21 @@ from .network import PolicyValueNet, ACTION_SPACE, NUM_PLANES
 # disque constante au lieu de linéaire dans le temps.
 CHECKPOINT_RETENTION = 5
 
+# Fenêtre glissante du tampon de rejeu, en nombre de *positions* (pas de
+# parties) : ~5000 parties récentes à la moyenne mesurée de 14,8
+# positions/partie sur le premier run réel (mémoire
+# santoni-mcts-az-no-power-chantier, 2026-10-11, checkpoint gen-5765).
+# Approximation volontaire par comptage de positions plutôt que de parties
+# exactes : c'est le nombre de positions qui compte pour la mémoire et
+# l'échantillonnage, suivre des frontières de parties exactes n'apporterait
+# rien ici. Avant ce correctif, `train_step` supprimait chaque exemple après
+# un seul pas de gradient (jamais revu) — un mauvais régime pour une cible
+# de valeur intrinsèquement bruitée (l'issue d'une seule partie) : diagnostic
+# empirique sur `gen-5765.pt` montrant une tête de valeur au niveau du
+# hasard (53,3% de concordance de signe, contre 54,4% pour un réseau non
+# entraîné) malgré une confiance extrême.
+MAX_BUFFER_POSITIONS = 74_000
+
 _GENERATION_PATTERN = re.compile(r'^gen-(\d+)\.pt$')
 
 
@@ -33,48 +49,58 @@ def checkpoint_generation(path):
 
 
 class Trainer:
-    def __init__(self, games_dir, checkpoint_dir, net_factory=lambda: PolicyValueNet()):
+    def __init__(self, games_dir, checkpoint_dir, net_factory=lambda: PolicyValueNet(),
+                 max_buffer_positions=MAX_BUFFER_POSITIONS):
         self.games_dir = Path(games_dir)
         self.checkpoint_dir = Path(checkpoint_dir)
         self.net = net_factory()
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=1e-3)
         self.generation = 0
+        self.max_buffer_positions = max_buffer_positions
         self._consumed_games = set()
-        self._examples = []  # (planes_placeholder, policy_target, value_target)
+        self._examples = []  # (planes, policy_target, value_target)
+
+    @staticmethod
+    def _decode_position(position, ply, outcome):
+        """Décode une position d'un `GameRecord` (`mcts_io.rs`) en exemple
+        d'entraînement. Partagée entre `consume_new_games` et la
+        reconstruction du tampon au démarrage (Task 2) : une seule
+        implémentation de la convention de signe par ply, jamais dupliquée."""
+        planes = torch.tensor(position["planes"], dtype=torch.float32).view(NUM_PLANES, 5, 5)
+        total_visits = sum(visits for _, visits in position["visits"])
+        policy_target = torch.zeros(ACTION_SPACE)
+        for action_idx, visits in position["visits"]:
+            policy_target[action_idx] = visits / total_visits
+        # Alternance stricte joueur 0 / joueur 1 à chaque ply : vraie pour
+        # toute la partie dans le sous-jeu sans pouvoir, où `is_in_scope`
+        # (native_engine/src/mcts.rs) impose `powers == [0, 0]` sur toute
+        # position rencontrée. `outcome` est fixé du point de vue du
+        # joueur 0 (cf. `play_one_game`) ; ce signe le reprojette depuis le
+        # point de vue du joueur réellement au trait à ce ply.
+        value_target = outcome if ply % 2 == 0 else -outcome
+        return planes, policy_target, float(value_target)
 
     def consume_new_games(self):
         new_files = sorted(
             f for f in self.games_dir.glob("game-*.json") if f.name not in self._consumed_games
         )
         for f in new_files:
-            data = json.loads(f.read_text())
+            try:
+                data = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                # Fichier corrompu ou vide (ex. écrit sans fsync avant le
+                # renommage atomique, cf. `mcts_io::write_game_atomically`,
+                # et coupure de courant) : marqué consommé pour ne jamais
+                # être retenté, mais aucun exemple n'en est tiré.
+                self._consumed_games.add(f.name)
+                continue
             outcome = data["outcome"]
-            for action_idx, visits in data["moves"]:
-                policy_target = torch.zeros(ACTION_SPACE)
-                policy_target[action_idx] = 1.0  # cible simplifiée : un seul coup joué
-                # LIMITATION CONNUE, NON RÉSOLUE — placeholder, pas une
-                # entrée réelle : `torch.zeros(NUM_PLANES, 5, 5)` tient lieu
-                # d'état de plateau encodé. Le réseau reçoit donc exactement
-                # la même entrée constante pour *tous* les exemples, quelle
-                # que soit la position réellement jouée, et ne peut rien
-                # apprendre qui dépende de la position : il ne peut au mieux
-                # qu'ajuster un biais vers la distribution marginale des
-                # coups et des résultats. Toute mesure de force de jeu du
-                # candidat avant le remplacement de ce placeholder mesure un
-                # MCTS à priors quasi constants, pas un AlphaZero entraîné.
-                # Pour le lever il faut rejouer chaque partie depuis sa
-                # position de départ en appliquant les coups du
-                # `GameRecord` et encoder chaque position intermédiaire
-                # (`santoni_engine::mcts::encode_planes`, PLANE_BYTES=150 =
-                # 6 plans de 5x5) — le format de partie actuel ne stocke que
-                # `(action_index, total_visits)` par tour, ce qui suffit à
-                # cette reconstruction mais exige de l'implémenter.
-                # Deuxième limitation, du même ordre et distincte : la cible
-                # de politique one-hot ci-dessus (voir le commentaire de la
-                # Task 9 du plan) au lieu de la distribution des visites sur
-                # tous les coups légaux du tour.
-                self._examples.append((torch.zeros(NUM_PLANES, 5, 5), policy_target, float(outcome)))
+            for ply, position in enumerate(data["positions"]):
+                self._examples.append(self._decode_position(position, ply, outcome))
             self._consumed_games.add(f.name)
+        excess = len(self._examples) - self.max_buffer_positions
+        if excess > 0:
+            del self._examples[:excess]
         return len(new_files)
 
     def add_exact_examples(self, examples):
@@ -95,18 +121,17 @@ class Trainer:
     def train_step(self, batch_size=64):
         if not self._examples:
             return 0.0
-        batch = self._examples[:batch_size]
+        batch = random.sample(self._examples, min(batch_size, len(self._examples)))
         planes = torch.stack([p for p, _, _ in batch])
         policy_targets = torch.stack([pt for _, pt, _ in batch])
         value_targets = torch.tensor([vt for _, _, vt in batch]).unsqueeze(1)
         policy_logits, value_pred = self.net(planes)
-        policy_loss = F.cross_entropy(policy_logits, policy_targets.argmax(dim=1))
+        policy_loss = F.cross_entropy(policy_logits, policy_targets)
         value_loss = F.mse_loss(value_pred, value_targets)
         loss = policy_loss + value_loss
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        del self._examples[:len(batch)]
         return float(loss.item())
 
     def save_checkpoint(self):
@@ -117,8 +142,6 @@ class Trainer:
             "generation": self.generation,
             "model_state": self.net.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
-            "consumed_games": sorted(self._consumed_games),
-            "examples": self._examples,
         }, tmp)
         os.replace(tmp, path)
         self._prune_checkpoints()
@@ -161,13 +184,58 @@ class Trainer:
                       for path in self.checkpoint_dir.glob("gen-*.pt")
                       for generation in [checkpoint_generation(path)]
                       if generation is not None]
-        if not candidates:
-            return 0
-        latest = max(candidates, key=lambda item: item[0])[1]
-        data = torch.load(latest, weights_only=False)
-        self.net.load_state_dict(data["model_state"])
-        self.optimizer.load_state_dict(data["optimizer_state"])
-        self.generation = data["generation"]
-        self._consumed_games = set(data["consumed_games"])
-        self._examples = data["examples"]
+        if candidates:
+            latest = max(candidates, key=lambda item: item[0])[1]
+            data = torch.load(latest, weights_only=False)
+            self.net.load_state_dict(data["model_state"])
+            self.optimizer.load_state_dict(data["optimizer_state"])
+            self.generation = data["generation"]
+        # Le tampon n'est jamais sérialisé dans le checkpoint (voir
+        # `_rebuild_buffer_from_disk`) : il se reconstruit toujours depuis
+        # les fichiers de parties sur disque, qu'un checkpoint modèle ait
+        # été trouvé ci-dessus ou non.
+        self._rebuild_buffer_from_disk()
         return self.generation
+
+    def _rebuild_buffer_from_disk(self):
+        """Reconstruit `_examples`/`_consumed_games` depuis les fichiers de
+        parties déjà sur disque, jamais depuis le checkpoint (qui ne les
+        contient plus) -- ils restent la seule source de vérité durable
+        pour les données d'entraînement (§3.2 du spec
+        2026-10-11-trainer-replay-buffer-design.md). Les noms de fichiers
+        (`game-{pid}-{:06}.json`) ne sont pas triables chronologiquement
+        entre workers distincts (chaque worker a son propre compteur
+        local, cf. `selfplay_worker.rs::main`) : on trie par date de
+        modification. Tous les fichiers trouvés sont marqués consommés,
+        même ceux dont le contenu n'est pas chargé dans le tampon, sinon un
+        futur `consume_new_games()` réingérerait tout l'historique plus
+        ancien que la fenêtre dès le prochain appel. Ne lit le *contenu*
+        que des fichiers retenus dans la fenêtre -- le temps de démarrage
+        reste borné indépendamment de la taille totale du corpus déjà
+        accumulé.
+        """
+        self._examples = []
+        self._consumed_games = set()
+        all_files = sorted(
+            self.games_dir.glob("game-*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        kept_in_order = []
+        total = 0
+        for f in all_files:
+            self._consumed_games.add(f.name)
+            if total < self.max_buffer_positions:
+                try:
+                    data = json.loads(f.read_text())
+                except (json.JSONDecodeError, OSError):
+                    # Même raison que dans `consume_new_games` : un fichier
+                    # corrompu ou vide ne doit pas bloquer tout redémarrage.
+                    continue
+                kept_in_order.append(data)
+                total += len(data["positions"])
+        for data in reversed(kept_in_order):
+            outcome = data["outcome"]
+            for ply, position in enumerate(data["positions"]):
+                self._examples.append(self._decode_position(position, ply, outcome))
+        excess = len(self._examples) - self.max_buffer_positions
+        if excess > 0:
+            del self._examples[:excess]

@@ -32,24 +32,36 @@ class Orchestrator:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.socket_path = str(self.run_dir / "infer.sock")
         self.worker_count = worker_count
-        # Deliberately lower than a "real" training run might use. The
-        # worker (Task 8) only checks the SIGINT-set interrupt flag between
+        # Was 8 (a deliberately shallow search to keep worst-case shutdown
+        # latency low -- see below). Raised to 32 after an 8-minute real
+        # self-play+training sanity check (169 games, 2026-10-10) showed
+        # 8 simulations only touches ~4.9 distinct moves per position on
+        # average (capped at simulations_per_move, since each simulation can
+        # add at most one visit to one edge) against a mean branching factor
+        # of ~33 legal moves -- a real but coarse policy target. 32 raises
+        # that ceiling fourfold while staying inside the ~20-30s per-game
+        # shutdown-latency bound already measured and accepted below for
+        # this exact value.
+        #
+        # The worker only checks the SIGINT-set interrupt flag between
         # games, never between individual simulations/moves (see the comment
         # above `INTERRUPTED` in native_engine/src/bin/selfplay_worker.rs),
         # and every simulation is its own request/response round trip
-        # through InferenceServer (Task 7) rather than a batched call.
-        # Measured empirically against the real server in this environment:
-        # each round trip costs on the order of 100-200ms (dominated by
-        # InferenceServer._accept_loop's 0.1s accept() poll interval, which
-        # this task must not change -- Task 7 is already approved), so a
-        # single game at e.g. 32 simulations/move can take 20-30s to reach
-        # the next interrupt check. stop() would then have to block that
-        # long before a SIGINT takes effect. Using a shallower search here
-        # keeps worst-case shutdown latency low and predictable while still
-        # exercising real MCTS + real inference end to end; this is a
-        # process-wiring choice local to this file, not a change to any
-        # approved component.
-        self.simulations_per_move = 8
+        # through InferenceServer rather than a batched call. Measured
+        # empirically against the real server in this environment: each
+        # round trip costs on the order of 20ms at the default
+        # `flush_interval_s=0.02` -- not dominated by connection setup
+        # (reusing one persistent connection per worker instead of
+        # reconnecting per leaf changed this cost by under 1%, see the
+        # doc-comment on `SocketEvaluator` in selfplay_worker.rs) but by this
+        # periodic flush interval itself, which this task must not change.
+        # A full game runs many moves, each needing 32 such round trips, so
+        # a single game can still take on the order of 10-20s to reach the
+        # next interrupt check. stop() would then have to block that long
+        # before a SIGINT takes effect -- bounded and predictable, which is
+        # what matters here, not minimal; this is a process-wiring choice
+        # local to this file, not a change to any approved component.
+        self.simulations_per_move = 32
         self.trainer = Trainer(str(self.games_dir), str(self.checkpoint_dir))
         self._server = None
         self._server_thread = None
@@ -60,6 +72,13 @@ class Orchestrator:
         # checkpoint ; `None` = aucune encore faite dans ce processus. Lu et
         # écrit uniquement par `_train_loop`.
         self._last_save = None
+        # Dernière perte renvoyée par un vrai pas de gradient (`None` =
+        # aucun encore eu dans ce processus ; `train_step` renvoie
+        # exactement `0.0` quand sa file est vide, cf. `_train_loop`, donc
+        # `None` reste le seul moyen non ambigu de dire "pas encore
+        # entraîné" plutôt que "perte nulle"). Lu et écrit uniquement par
+        # `_train_loop`, exposé en lecture via `status()`.
+        self._last_loss = None
         # Guards reads of self.trainer.generation / self._workers against
         # the background _train_loop thread so status() never observes a
         # torn mid-mutation state (e.g. Trainer.save_checkpoint()
@@ -111,6 +130,9 @@ class Orchestrator:
             self.trainer.consume_new_games()
             loss = self.trainer.train_step()
             trained = loss != 0.0
+            if trained:
+                with self._status_lock:
+                    self._last_loss = loss
             now = time.monotonic()
             due = self._last_save is None or now - self._last_save >= MIN_CHECKPOINT_INTERVAL_S
             if trained and due:
@@ -140,8 +162,10 @@ class Orchestrator:
         alive = sum(1 for p in self._workers if p.poll() is None)
         with self._status_lock:
             generation = self.trainer.generation
+            last_loss = self._last_loss
         return {
             "generation": generation,
             "games_available": len(list(self.games_dir.glob("game-*.json"))),
             "workers_alive": alive,
+            "last_loss": last_loss,
         }

@@ -21,7 +21,12 @@ def test_worker_produces_complete_valid_games(tmp_path):
     for f in files:
         data = json.loads(f.read_text())
         assert data["outcome"] in (-1, 1)
-        assert len(data["moves"]) > 0
+        assert len(data["positions"]) > 0
+        first = data["positions"][0]
+        assert len(first["planes"]) == 150
+        assert all(b in (0, 1) for b in first["planes"])
+        assert len(first["visits"]) > 0
+        assert all(isinstance(pair, list) and len(pair) == 2 for pair in first["visits"])
     assert not list(out_dir.glob("*.tmp"))
 
 
@@ -59,7 +64,7 @@ def test_concurrent_workers_do_not_overwrite_each_others_games(tmp_path):
     for f in files:
         data = json.loads(f.read_text())
         assert data["outcome"] in (-1, 1)
-        assert len(data["moves"]) > 0
+        assert len(data["positions"]) > 0
     assert not list(out_dir.glob("*.tmp"))
 
 

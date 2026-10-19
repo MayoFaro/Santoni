@@ -46,6 +46,77 @@ def test_two_concurrent_clients_get_correct_shaped_responses(tmp_path):
         assert -1 <= values[0] <= 1
 
 
+def test_client_can_reuse_the_same_connection_for_multiple_requests(tmp_path):
+    socket_path = str(tmp_path / "infer_reuse.sock")
+    net = PolicyValueNet(channels=8, blocks=1)
+    server = InferenceServer(socket_path, net, flush_interval_s=0.02)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(socket_path)
+    planes = bytes(PLANE_BYTES)
+
+    def one_round_trip():
+        sock.sendall(pack_request([planes]))
+        header = sock.recv(4)
+        (count,) = struct.unpack("<I", header)
+        needed = count * (ACTION_SPACE * 4 + 4)
+        body = b""
+        while len(body) < needed:
+            body += sock.recv(needed - len(body))
+        return unpack_response(header + body, batch_size=count)
+
+    for _ in range(3):
+        policies, values = one_round_trip()
+        assert len(policies[0]) == ACTION_SPACE
+        assert -1 <= values[0] <= 1
+
+    sock.close()
+    server.stop()
+
+
+def test_two_persistent_clients_each_send_multiple_sequential_requests(tmp_path):
+    socket_path = str(tmp_path / "infer_multi_persist.sock")
+    net = PolicyValueNet(channels=8, blocks=1)
+    server = InferenceServer(socket_path, net, flush_interval_s=0.02)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+
+    def client(results, index):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        planes = bytes(PLANE_BYTES)
+        got = []
+        for _ in range(3):
+            sock.sendall(pack_request([planes]))
+            header = sock.recv(4)
+            (count,) = struct.unpack("<I", header)
+            needed = count * (ACTION_SPACE * 4 + 4)
+            body = b""
+            while len(body) < needed:
+                body += sock.recv(needed - len(body))
+            got.append(unpack_response(header + body, batch_size=count))
+        results[index] = got
+        sock.close()
+
+    results = {}
+    t1 = threading.Thread(target=client, args=(results, 0))
+    t2 = threading.Thread(target=client, args=(results, 1))
+    t1.start(); t2.start()
+    t1.join(timeout=5); t2.join(timeout=5)
+    server.stop()
+
+    assert len(results) == 2
+    for got in results.values():
+        assert len(got) == 3
+        for policies, values in got:
+            assert len(policies[0]) == ACTION_SPACE
+            assert -1 <= values[0] <= 1
+
+
 def test_flush_loop_final_drain_catches_request_queued_at_shutdown(tmp_path):
     """Regression test for a shutdown race: a request that lands in
     `_pending` after the flush thread's last timed drain, but before

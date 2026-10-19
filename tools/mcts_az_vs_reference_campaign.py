@@ -50,18 +50,24 @@ from __future__ import annotations
 
 import argparse
 import ctypes as C
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import hashlib
 import json
+import multiprocessing
 import os
+import platform
 import random
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
+
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'experiments/references/b698745'
@@ -69,9 +75,11 @@ CORPUS = ROOT / 'experiments/no-power-corpus-20261010/campaign.json'
 WORKER_BINARY = ROOT / 'native_engine' / 'target' / 'release' / 'selfplay_worker'
 
 sys.path.insert(0, str(ROOT))
-from santorini.engine import Action, Position, validate_setup, validate_turn  # noqa: E402
+from santorini.engine import Action, Position, terminal_position, validate_setup, validate_turn  # noqa: E402
 from santorini.native import ACTION_KINDS, encode, CAction, native_search  # noqa: E402
 from santorini import native  # noqa: E402
+from santoni_az.network import PolicyValueNet  # noqa: E402
+from santoni_az.inference_server import InferenceServer  # noqa: E402
 
 
 def digest(path):
@@ -115,6 +123,46 @@ def freeze_reference(directory):
     return binary, frozen
 
 
+def load_checkpoint_net(path):
+    data = torch.load(path, weights_only=False)
+    net = PolicyValueNet()
+    net.load_state_dict(data['model_state'])
+    net.eval()
+    return net
+
+
+def freeze_checkpoint(directory, checkpoint_path):
+    """Snapshot the checkpoint file currently at `checkpoint_path` into the
+    campaign directory, exactly the same rationale as `freeze_reference`
+    above applied to the candidate side: pin precisely what is being
+    measured, so a checkpoint file changing on disk mid-campaign (e.g.
+    training continuing to write to the same path, or simply pointing a
+    resumed run at a different file) can never silently change what 'the
+    candidate' means partway through, and is caught loudly instead."""
+    target = directory / 'candidate'
+    target.mkdir(exist_ok=True)
+    binary = target / 'checkpoint.pt'
+    manifest = target / 'manifest.json'
+    if not manifest.exists():
+        shutil.copy2(checkpoint_path, binary)
+        generation = torch.load(binary, weights_only=False)['generation']
+        atomic_json(manifest, {'checkpoint_sha256': digest(binary), 'generation': generation})
+    frozen = json.loads(manifest.read_text())
+    if digest(binary) != frozen['checkpoint_sha256']:
+        raise ValueError('Candidate checkpoint snapshot integrity mismatch')
+    # Au-dessus, on ne vérifie que la copie figée contre elle-même -- ça ne
+    # détecte jamais une reprise pointée vers un `--checkpoint` différent de
+    # celui de la toute première exécution (revue finale : vérifié qu'une
+    # reprise avec un fichier différent était silencieusement acceptée et
+    # mesurait l'ancien réseau sous le nom de la nouvelle génération).
+    if digest(checkpoint_path) != frozen['checkpoint_sha256']:
+        raise ValueError(
+            f'--checkpoint {checkpoint_path} differs from the checkpoint frozen for this '
+            f'campaign (generation {frozen["generation"]}); choose a new output folder'
+        )
+    return binary, frozen
+
+
 def set_engine(lib):
     if os.environ.get('SANTONI_ENGINE_LIB') != str(lib):
         os.environ['SANTONI_ENGINE_LIB'] = str(lib)
@@ -139,7 +187,7 @@ def bootstrap(groups):
     return [samples[125], samples[4874]]
 
 
-def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
+def candidate_move(position, seconds, socket_path, scratch_dir):
     state = encode(position)
     input_path = scratch_dir / 'state.bin'
     output_path = scratch_dir / 'move.bin'
@@ -147,9 +195,8 @@ def candidate_move(position, seconds, checkpoint, socket_path, scratch_dir):
     if output_path.exists():
         output_path.unlink()
     cmd = [str(WORKER_BINARY), '--single-move', '--input-state', str(input_path),
-           '--output-move', str(output_path), '--seconds', str(seconds)]
-    if socket_path:
-        cmd += ['--inference-socket', str(socket_path)]
+           '--output-move', str(output_path), '--seconds', str(seconds),
+           '--inference-socket', str(socket_path)]
     started = time.monotonic()
     result = subprocess.run(cmd, timeout=seconds + 10, capture_output=True, text=True)
     if result.returncode != 0:
@@ -188,26 +235,30 @@ def reference_move(position, seconds, reference_binary):
     return analysis.turn, analysis.elapsed
 
 
-def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, reference_binary):
+def play(job, directory, seconds, socket_path, reference_binary):
     initial = job['initial']
     path = Path(directory) / f"game-{job['number']:04d}.json"
     position = validate_setup(initial['workers'], initial['powers'], initial['first'])
     data = {'job': job, 'status': 'running', 'decisions': []}
     atomic_json(path, data)
     try:
-        for ply in range(150):
-            is_candidate = position.player == job['variant_player']
-            if is_candidate:
-                turn, elapsed = candidate_move(position, seconds, checkpoint, socket_path, scratch_dir)
-            else:
-                turn, elapsed = reference_move(position, seconds, reference_binary)
-            data['decisions'].append({'ply': ply + 1, 'player': position.player,
-                                       'backend': 'candidate' if is_candidate else 'reference',
-                                       'elapsed': elapsed})
-            position = turn.after
-            atomic_json(path, {**data, 'position': position.to_dict()})
-            if position.winner is not None:
-                break
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch_dir = Path(scratch)
+            for ply in range(150):
+                checked = terminal_position(position)
+                if checked.winner is not None:
+                    position = checked
+                    break
+                is_candidate = position.player == job['variant_player']
+                if is_candidate:
+                    turn, elapsed = candidate_move(position, seconds, socket_path, scratch_dir)
+                else:
+                    turn, elapsed = reference_move(position, seconds, reference_binary)
+                data['decisions'].append({'ply': ply + 1, 'player': position.player,
+                                           'backend': 'candidate' if is_candidate else 'reference',
+                                           'elapsed': elapsed})
+                position = turn.after
+                atomic_json(path, {**data, 'position': position.to_dict()})
         data['status'] = 'finished' if position.winner is not None else 'inconclusive'
     except Exception as exc:
         data.update(status='error', error=f'{type(exc).__name__}: {exc}')
@@ -215,6 +266,57 @@ def play(job, directory, seconds, checkpoint, socket_path, scratch_dir, referenc
     atomic_json(path, data)
     return {'number': job['number'], 'status': data['status'],
             'variant_won': position.winner == job['variant_player'] if position.winner is not None else None}
+
+
+def compute_pending_jobs(directory, jobs):
+    """Coups restants à jouer : ignore les parties déjà terminées, met en
+    quarantaine (`attempts/`, suffixe horodaté) les parties incomplètes
+    d'une exécution précédente plutôt que de les écraser silencieusement sur
+    place. Même motif que `tools/hermes_canonicalisation_campaign.py`
+    (lignes ~367-379)."""
+    pending = []
+    for job in jobs:
+        path = directory / f"game-{job['number']:04d}.json"
+        if path.exists():
+            old = json.loads(path.read_text())
+            if old['job'] != job:
+                raise ValueError(f'Job mismatch: {path}')
+            if old['status'] == 'finished':
+                continue
+            attempts = directory / 'attempts'
+            attempts.mkdir(exist_ok=True)
+            path.rename(attempts / f'{path.stem}-{time.time_ns()}.json')
+        pending.append(job)
+    return pending
+
+
+def check_manifest_matches(manifest_path, config):
+    """Écrit `campaign.json` au premier lancement sur ce dossier ; aux
+    lancements suivants, vérifie que la configuration n'a pas changé plutôt
+    que de mélanger silencieusement deux campagnes incompatibles (graine,
+    checkpoint, moteur de référence...) dans le même répertoire."""
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text())
+        if {k: v for k, v in previous.items() if k != 'started_at'} != config:
+            raise ValueError('Campaign provenance/parameters differ; choose a new output folder')
+    else:
+        atomic_json(manifest_path, {'started_at': time.time(), **config})
+        shutil.copy2(Path(__file__), manifest_path.parent / 'runner.py')
+
+
+def record_run(directory, workers, cpus):
+    """Journal (append-only) d'une ligne par invocation de `main()`, distinct
+    de `campaign.json` : `--workers`/les CPU réellement utilisés varient
+    légitimement d'une reprise à l'autre (ex. reprendre à 2 workers une
+    campagne lancée à 8) et ne doivent donc pas faire partie de la
+    configuration comparée par `check_manifest_matches` -- mais les
+    perdre complètement viderait de sens un win-rate agrégé sur des
+    moitiés de campagne mesurées avec des parallélismes différents
+    (revue finale)."""
+    path = directory / 'runs.json'
+    runs = json.loads(path.read_text()) if path.exists() else []
+    runs.append({'started_at': time.time(), 'workers': workers, 'cpus': cpus})
+    atomic_json(path, runs)
 
 
 def summary(directory, corpus):
@@ -276,23 +378,54 @@ def check_corpus_is_no_power(jobs_all):
         raise ValueError(f'Corpus {CORPUS} contains no job')
 
 
+def physical_cpus():
+    cores = {}
+    for cpu in sorted(os.sched_getaffinity(0)):
+        base = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+        key = ((base / 'physical_package_id').read_text(), (base / 'core_id').read_text())
+        cores.setdefault(key, cpu)
+    return list(cores.values())
+
+
+def initialize(cpus):
+    os.nice(10)
+    identity = multiprocessing.current_process()._identity[0]
+    os.sched_setaffinity(0, {cpus[(identity - 1) % len(cpus)]})
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--seconds', type=float, default=30.0)
-    parser.add_argument('--inference-socket', default=None,
-                         help='Socket du serveur d\'inférence déjà démarré ; sans cette option, '
-                              'le worker utilise un évaluateur uniforme (politique aléatoire).')
     parser.add_argument('--out', required=True)
+    parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--limit', type=int, default=None,
                          help='Only run the first N scheduled games (pilot runs); '
                               'same convention as tools/hermes_canonicalisation_campaign.py --limit.')
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error('workers must be positive')
     verify_reference()
     directory = Path(args.out)
     directory.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    lock = (directory / '.campaign.lock').open('w')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     reference_binary, reference_manifest = freeze_reference(directory)
     print(f"REFERENCE frozen: {reference_binary} sha256={reference_manifest['engine_sha256']}", flush=True)
+    # `freeze_checkpoint` elle-même reste ici, tôt : c'est une vérification
+    # bon marché (quelques hachages) qui peut rejeter la campagne (reprise
+    # avec un `--checkpoint` différent). Le chargement du réseau complet et
+    # le démarrage du vrai `InferenceServer` -- coûteux, et porteurs du
+    # risque documenté dans `InferenceServer.__init__` (thread torch vivant
+    # qui course la fin d'interpréteur) -- sont repoussés après toutes les
+    # validations bon marché ci-dessous, pour qu'un corpus invalide ou une
+    # config incompatible échoue avant d'avoir payé ce coût et ouvert ce
+    # risque pour rien (revue finale).
+    try:
+        candidate_binary, candidate_manifest = freeze_checkpoint(directory, Path(args.checkpoint))
+    except ValueError as exc:
+        parser.error(str(exc))
     corpus = json.loads(CORPUS.read_text())
     jobs_all = corpus['jobs']
     check_corpus_is_no_power(jobs_all)
@@ -300,14 +433,59 @@ def main():
             for i, (job, player) in enumerate((job, player) for job in jobs_all for player in (0, 1))]
     if args.limit:
         jobs = jobs[:args.limit]
-    with tempfile.TemporaryDirectory() as scratch:
-        scratch_dir = Path(scratch)
-        results = [play(job, directory, args.seconds, args.checkpoint, args.inference_socket, scratch_dir,
-                         reference_binary)
-                   for job in jobs]
+    cpu_model = next((line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
+                       if line.startswith('model name')), 'unknown')
+    config = {'protocol': 'mcts-az-vs-reference-no-power-30s-v1', 'seconds': args.seconds, 'jobs': jobs,
+              'seed': corpus['seed'], 'reference_engine_sha256': reference_manifest['engine_sha256'],
+              'candidate_checkpoint_sha256': candidate_manifest['checkpoint_sha256'],
+              'candidate_checkpoint_generation': candidate_manifest['generation'],
+              'corpus_sha256': digest(CORPUS), 'runner_sha256': digest(Path(__file__)),
+              'cpu_model': cpu_model, 'platform': platform.platform(), 'python': platform.python_version()}
+    try:
+        check_manifest_matches(directory / 'campaign.json', config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    pending = compute_pending_jobs(directory, jobs)
+    cpus = physical_cpus()[:args.workers]
+    record_run(directory, args.workers, cpus)
+    net = load_checkpoint_net(candidate_binary)
+    socket_path = str(directory / 'infer.sock')
+    server = InferenceServer(socket_path, net)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    time.sleep(0.1)
+    print(f"CANDIDATE checkpoint generation={candidate_manifest['generation']} "
+          f"sha256={candidate_manifest['checkpoint_sha256']}", flush=True)
+    print(f'START {len(pending)}/{len(jobs)} remaining; {args.seconds}s/move; CPUs {cpus}', flush=True)
+    try:
+        with ProcessPoolExecutor(max_workers=len(cpus), mp_context=multiprocessing.get_context('spawn'),
+                                  initializer=initialize, initargs=(cpus,)) as pool:
+            futures = {pool.submit(play, job, str(directory), args.seconds, socket_path, str(reference_binary))
+                       for job in pending}
+            while futures:
+                done, futures = wait(futures, timeout=30, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        print('GAME ' + json.dumps(future.result()), flush=True)
+                    except Exception as exc:
+                        # Un enfant tué (OOM, segfault...) lève ici plutôt que
+                        # de renvoyer un résultat ; laisser cette exception
+                        # remonter couperait la boucle avant le FINAL/summary
+                        # ci-dessous, privant l'opérateur du seul rapport
+                        # utile après potentiellement des heures de calcul
+                        # (revue finale). L'état sur disque reste reprenable
+                        # quoi qu'il arrive -- chaque écriture est atomique.
+                        print(f'GAME-FAILED {type(exc).__name__}: {exc}', flush=True)
+                result = summary(directory, corpus)
+                report(directory, result)
+                print(f"PROGRESS {result['completed']}/{len(jobs)}; errors={len(result['errors'])}", flush=True)
+    finally:
+        server.stop()
     result = summary(directory, corpus)
     report(directory, result)
-    print(json.dumps(result, indent=2))
+    print('FINAL ' + json.dumps(result, ensure_ascii=False), flush=True)
+    if result['completed'] != len(jobs):
+        raise SystemExit('Campaign requires review: incomplete games')
 
 
 if __name__ == '__main__':
