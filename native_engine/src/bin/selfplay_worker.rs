@@ -270,8 +270,35 @@ fn run_single_move(input_state: &PathBuf, output_move: &PathBuf, seconds: f64, e
     std::fs::rename(&tmp, output_move).expect("renommage du coup impossible");
 }
 
+/// Mode « encodage de plans » : expose `mcts::encode_planes` à une position
+/// arbitraire du sous-jeu sans pouvoir depuis Python (Task 1 du plan
+/// d'ancre prouvée), sans dupliquer la logique d'encodage côté Python.
+/// Même convention d'entrée que `run_single_move` ci-dessus (octets bruts
+/// de `State`, `read_unaligned` par prudence d'alignement, `is_in_scope`
+/// vérifié avant tout calcul) et même écriture atomique en sortie
+/// (fichier `.tmp` puis `rename`) : un seul format d'échange binaire entre
+/// ce worker et ses appelants Python, pas une variante par mode.
+fn run_encode_planes(input_state: &PathBuf, output_planes: &PathBuf) {
+    let bytes = std::fs::read(input_state).expect("lecture de l'état d'entrée impossible");
+    assert_eq!(bytes.len(), std::mem::size_of::<State>(), "taille d'état incompatible");
+    let state: State = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const State) };
+    assert!(santoni_engine::mcts::is_in_scope(&state), "position hors périmètre sans-pouvoir");
+
+    let planes = santoni_engine::mcts::encode_planes(&state);
+
+    let tmp = output_planes.with_extension("bin.tmp");
+    std::fs::write(&tmp, planes).expect("écriture des plans impossible");
+    std::fs::rename(&tmp, output_planes).expect("renommage des plans impossible");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--encode-planes") {
+        let input_state = PathBuf::from(parse_arg(&args, "--input-state"));
+        let output_planes = PathBuf::from(parse_arg(&args, "--output-planes"));
+        run_encode_planes(&input_state, &output_planes);
+        return;
+    }
     if args.iter().any(|a| a == "--single-move") {
         let input_state = PathBuf::from(parse_arg(&args, "--input-state"));
         let output_move = PathBuf::from(parse_arg(&args, "--output-move"));
