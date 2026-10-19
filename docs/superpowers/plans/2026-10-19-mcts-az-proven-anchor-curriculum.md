@@ -294,6 +294,7 @@ git commit -m "feat: derive proven win/loss verdicts for individual moves from t
 
 ```python
 # tests/test_proven_anchor_layer.py
+import pytest
 from santorini.engine import Position
 from santorini.native import native_turns
 from tools.proven_anchor.layer import build_layer
@@ -512,6 +513,7 @@ Expected: PASS
 
 ```python
 # tests/test_proven_anchor_training_examples.py
+import pytest
 from santorini.engine import Position
 from santorini.native import native_turns
 from tools.proven_anchor.training_examples import action_index
@@ -621,6 +623,7 @@ git commit -m "feat: feed exact proven-core labels into Trainer as supervised ex
 
 ```python
 # tests/test_proven_anchor_validation.py
+import pytest
 import torch
 from tools.proven_anchor.validation import sign_match_rate, bootstrap_ci, layer_passes_validation
 from santoni_az.network import PolicyValueNet
@@ -698,6 +701,7 @@ git commit -m "feat: validate a trained layer's sign-match against a baseline, b
 
 ```python
 # tests/test_proven_anchor_curriculum_orchestration.py
+import pytest
 from tools.proven_anchor_curriculum import run_curriculum
 
 class FakeTrainer:
