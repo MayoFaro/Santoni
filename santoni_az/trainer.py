@@ -77,6 +77,21 @@ class Trainer:
             self._consumed_games.add(f.name)
         return len(new_files)
 
+    def add_exact_examples(self, examples):
+        """Append exactly-labeled `(planes, policy_target, value_target)`
+        examples (same tuple shape `consume_new_games` already produces, so
+        `train_step` needs no change) straight into the training buffer,
+        e.g. from `tools.proven_anchor.training_examples.examples_from_layer`.
+
+        NOTE: this branch's `trainer.py` has diverged from `main` (common
+        ancestor `fedcab4`) and does not yet carry `main`'s later
+        `max_buffer_positions` buffer-cap commits (928dfc2, 02f80c2,
+        4dd6d6b) that the task brief assumed were already present here.
+        There is no existing cap to re-apply in this file as it stands, so
+        this just appends; re-apply whichever cap lands once this branch is
+        rebased/merged with those commits."""
+        self._examples.extend(examples)
+
     def train_step(self, batch_size=64):
         if not self._examples:
             return 0.0

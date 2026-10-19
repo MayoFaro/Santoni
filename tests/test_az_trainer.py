@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import torch
+
+from santoni_az.network import NUM_PLANES
 from santoni_az.trainer import CHECKPOINT_RETENTION, Trainer, checkpoint_generation
 
 
@@ -116,3 +119,17 @@ def test_save_checkpoint_prunes_all_but_the_retained_newest(tmp_path):
     # La reprise reste possible après élagage, sur la dernière génération.
     resumed = Trainer(str(games_dir), str(checkpoint_dir))
     assert resumed.load_latest_checkpoint() == 10005
+
+
+def test_add_exact_examples_are_immediately_trainable(tmp_path):
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    planes = torch.zeros(NUM_PLANES, 5, 5)
+    policy = torch.zeros(1250)
+    policy[0] = 1.0
+
+    trainer.add_exact_examples([(planes, policy, 1.0)])
+
+    assert len(trainer._examples) == 1
+    loss = trainer.train_step(batch_size=1)
+    assert loss > 0.0
