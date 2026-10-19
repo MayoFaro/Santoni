@@ -69,24 +69,66 @@ def test_run_curriculum_resets_the_failure_counter_after_a_pass_and_keeps_wideni
     monkeypatch.setattr(mod, "build_layer", lambda ancestor, seconds: object())
     monkeypatch.setattr(mod, "examples_from_layer", lambda layer: [(None, None, 1.0)])
 
-    # Scripted responses, in call order: pass (back=0, nothing validated yet
-    # so no cumulative re-check fires), fail, fail (two failures -- short of
-    # max_uninformative_layers=2, so the loop must not stop here), pass
-    # (back=18) which *does* trigger spec §2's cumulative re-check of the
-    # back=0 held-out set (one extra call) -- scripted to also pass, so the
-    # counter resets and widening continues. If the counter failed to reset
-    # after the first pass, the two failures alone would already exceed a
-    # threshold of 2 only once a 3rd failure landed -- this sequence instead
-    # proves the reset happened by reaching the history's natural exhaustion
-    # (back=24) with outcome still "success", not "failure".
-    responses = iter([True, False, False, True, True])
+    # Each distance now runs one per-game validation check per active
+    # anchor game (2 here), all evaluated (no short-circuiting) so every
+    # per-game held-out set is genuinely exercised. Scripted per distance:
+    # back=0 fails (both per-game checks False), back=6 fails too (two
+    # failures total -- short of max_uninformative_layers=2, so the loop
+    # must not stop here), back=12 passes (both True) with *no* cumulative
+    # re-check calls, since nothing validated earlier to re-check -- this
+    # keeps the script free of the cumulative re-check's call-count
+    # subtlety while still proving the reset: if the counter hadn't reset
+    # after this pass, a single further failure would push it over the
+    # threshold, but instead the loop runs all the way to this anchor
+    # game's natural exhaustion (back=18) with outcome still "success".
+    responses = iter([False, False, False, False, True, True])
     monkeypatch.setattr(mod, "layer_passes_validation", lambda *a, **k: next(responses))
 
-    qualifying_ply = 3 * 6  # exhausts after 4 attempted widens (back=0,6,12,18 valid; 24 invalid)
+    qualifying_ply = 2 * 6  # exhausts after 3 attempted widens (back=0,6,12 valid; 18 invalid)
     positions = [f"p{i}" for i in range(qualifying_ply + 1)]
     anchor_games = [(positions, qualifying_ply), (positions, qualifying_ply)]
 
     result = run_curriculum(anchor_games=anchor_games, reference_binary="fake",
                             seconds=0.1, trainer=FakeTrainer(), max_uninformative_layers=2)
 
-    assert result == {"layers_built": 8, "outcome": "stopped_success_exhausted"}
+    assert result == {"layers_built": 6, "outcome": "stopped_success_exhausted"}
+
+def test_run_curriculums_held_out_pool_never_validates_a_games_own_children(monkeypatch):
+    """Direct regression test for the leave-one-out fix: inspects the
+    actual `held_out` lists handed to `layer_passes_validation`, instead of
+    only stubbing its return value -- the gap that let the original
+    pooled-everyone-together bug through undetected."""
+    import types
+    import tools.proven_anchor_curriculum as mod
+
+    class FakeLayer:
+        def __init__(self, tag):
+            self.children = [(types.SimpleNamespace(after=f"child-from-{tag}"), True)]
+            self.ancestor_verdict = None  # keeps the symmetrized-ancestor pool out of scope here
+            self.ancestor = None
+
+    # build_layer is called once per active anchor game, in anchor_games
+    # order -- tag each fake layer with which game it came from so the
+    # held-out sets below can be checked for provenance.
+    layers = iter([FakeLayer("A"), FakeLayer("B")])
+    monkeypatch.setattr(mod, "build_layer", lambda ancestor, seconds: next(layers))
+    monkeypatch.setattr(mod, "examples_from_layer", lambda layer: [])
+
+    seen_held_out_sets = []
+
+    def fake_validate(net, baseline_net, held_out):
+        seen_held_out_sets.append(list(held_out))
+        return False
+
+    monkeypatch.setattr(mod, "layer_passes_validation", fake_validate)
+
+    run_curriculum(anchor_games=[(["p0", "p1"], 1), (["p0", "p1"], 1)],
+                   reference_binary="fake", seconds=0.1, trainer=FakeTrainer(),
+                   max_uninformative_layers=0)
+
+    assert len(seen_held_out_sets) == 2  # one per-game check this round
+    held_out_for_game_a, held_out_for_game_b = seen_held_out_sets
+    assert ("child-from-B", True) in held_out_for_game_a
+    assert ("child-from-A", True) not in held_out_for_game_a
+    assert ("child-from-A", True) in held_out_for_game_b
+    assert ("child-from-B", True) not in held_out_for_game_b
