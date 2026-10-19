@@ -46,8 +46,8 @@ def test_scan_game_for_forced_win_returns_none_when_absent(monkeypatch):
 def boxed_in_position(stuck_player):
     """Position of the no-power subgame where `stuck_player` has no legal
     move at all: both their workers sit at (12, 13), surrounded by domes on
-    every other square. Same construction as
-    `tests/test_mcts_az_vs_reference_campaign.py::boxed_in_position`."""
+    every other square, so `santorini.engine.terminal_position` resolves it
+    as an immediate loss for `stuck_player` without needing a real search."""
     domes = ((1 << 25) - 1) & ~((1 << 12) | (1 << 13))
     workers = ((12, 13), (0, 1)) if stuck_player == 0 else ((0, 1), (12, 13))
     return Position(workers=workers, domes=domes, player=stuck_player, powers=(0, 0))
