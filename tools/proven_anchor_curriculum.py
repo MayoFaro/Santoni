@@ -80,13 +80,14 @@ def _partition_children(layer):
     The split exists because these children are now *both* training signal
     (the only source of negative value labels, see
     `child_examples_from_layer`) and the held-out anti-memorization
-    evidence -- and a position cannot honestly be both. Every other round
-    the curriculum trains on one half and validates on the other, by
-    `native_turns` order, so a held-out child is never a position the
-    network was trained on at any distance. Judgment call: a 50/50 stride
-    split keeps both roles equally supplied; spec Sec 2's answer to a
-    held-out pool that is too small for a usable CI is more anchor games
-    (Sec 3.7), not a thinner validation half."""
+    evidence -- and a position cannot honestly be both. Every other child
+    in `native_turns` order goes to each role, so no child is ever
+    simultaneously trained on and used as evidence; the caller's own
+    `trained_positions` filter then catches the remaining case of the
+    *same* position turning up in another anchor game's validation half.
+    Judgment call: a 50/50 stride split keeps both roles equally supplied;
+    spec Sec 2's answer to a held-out pool that is too small for a usable
+    CI is more anchor games (Sec 3.7), not a thinner validation half."""
     usable = [
         (turn, verdict)
         for turn, verdict in layer.children
