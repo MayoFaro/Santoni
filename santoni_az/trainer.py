@@ -108,15 +108,13 @@ class Trainer:
         examples (same tuple shape `consume_new_games` already produces, so
         `train_step` needs no change) straight into the training buffer,
         e.g. from `tools.proven_anchor.training_examples.examples_from_layer`.
-
-        NOTE: this branch's `trainer.py` has diverged from `main` (common
-        ancestor `fedcab4`) and does not yet carry `main`'s later
-        `max_buffer_positions` buffer-cap commits (928dfc2, 02f80c2,
-        4dd6d6b) that the task brief assumed were already present here.
-        There is no existing cap to re-apply in this file as it stands, so
-        this just appends; re-apply whichever cap lands once this branch is
-        rebased/merged with those commits."""
+        Re-applies the same buffer cap `consume_new_games`/
+        `_rebuild_buffer_from_disk` already use, so exact examples can't
+        grow the buffer past `max_buffer_positions` either."""
         self._examples.extend(examples)
+        excess = len(self._examples) - self.max_buffer_positions
+        if excess > 0:
+            del self._examples[:excess]
 
     def train_step(self, batch_size=64):
         if not self._examples:
