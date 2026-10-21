@@ -372,6 +372,27 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, r
 /// désactive les deux (retombant sur l'argmax des visites, comme
 /// `run_single_move`) pour les tests et pour tout usage où la
 /// reproductibilité prime sur la diversité d'entraînement.
+///
+/// **Convention de signe de `GameRecord.outcome` : relative au candidat, pas
+/// au joueur 0.** `play_one_game` fixe `outcome` du point de vue du joueur 0
+/// (`if state.player == 0 { v } else { -v }`) — correct *dans ce contexte
+/// précis* uniquement parce que `initial_state()` y est toujours fixe et
+/// démarre toujours au joueur 0, donc "point de vue du joueur 0" et "point
+/// de vue de qui a joué le premier ply" coïncident trivialement là-bas. Ici,
+/// l'ancre `initial` est arbitraire et peut tout à fait démarrer au joueur 1
+/// (les deux tests de ce mode le font) : copier ce même test littéral
+/// aurait fixé `outcome` au joueur 0 *physique*, indépendamment de quel
+/// camp est réellement le candidat, alors que `Trainer._decode_position`
+/// (santoni_az/trainer.py) a besoin que `outcome` soit relatif à qui joue le
+/// ply 0 pour que sa règle `value_target = outcome if ply % 2 == 0 else
+/// -outcome` retombe juste. Comme le ply 0 est toujours joué par
+/// `candidate_player` (jamais par l'arbitre : c'est précisément ce que ce
+/// mode garantit), le test correct est `state.player == candidate_player`,
+/// pas `state.player == 0`. Avec cette convention, `outcome == 1` signifie
+/// uniformément "le candidat a gagné", quel que soit le camp physique qu'il
+/// a occupé pendant la partie — ce qui simplifie aussi la future tâche
+/// d'orchestrateur, qui n'a pas besoin de se souvenir séparément de quel
+/// camp physique l'ancre a donné au candidat pour interpréter `outcome`.
 fn play_one_game_vs_reference(
     initial: State,
     simulations_per_move: u32,
@@ -385,12 +406,21 @@ fn play_one_game_vs_reference(
     let mut positions = Vec::new();
     let mut rng = Xorshift64::new(rng_seed);
     loop {
-        // Même raisonnement que `play_one_game` : vérifier depuis le point
-        // de vue du joueur réellement au trait (`state.player`), pas depuis
-        // un camp fixe, pour que les deux branches (victoire et blocage)
+        // Même raisonnement que `play_one_game` pour l'appel à
+        // `terminal_value` lui-même : vérifier depuis le point de vue du
+        // joueur réellement au trait (`state.player`), pas depuis un camp
+        // fixe, pour que les deux branches (victoire et blocage)
         // déclenchent correctement quel que soit le camp au trait.
+        //
+        // En revanche, la reprojection de signe qui suit teste
+        // `state.player == candidate_player`, **pas** `state.player == 0`
+        // comme dans `play_one_game` : voir la note de convention de signe
+        // dans le commentaire de documentation ci-dessus. `v` est déjà du
+        // point de vue de `state.player` (contrat de `terminal_value`) ; ce
+        // test reprojette vers le point de vue du candidat, qui doit rester
+        // la référence fixe de `outcome` pour toute la partie.
         if let Some(v) = terminal_value(&state, state.player) {
-            let outcome = if state.player == 0 { v } else { -v };
+            let outcome = if state.player == candidate_player { v } else { -v };
             return GameRecord { positions, outcome: outcome as i8 };
         }
         let planes = santoni_engine::mcts::encode_planes(&state);
@@ -878,6 +908,30 @@ mod vs_reference_tests {
             assert_eq!(is_reference_ply, i % 2 == 1, "ply {i} has the wrong record shape");
         }
         assert!(record.positions.len() >= 2);
+    }
+
+    /// Pin de régression pour le biais de signe trouvé en revue : une
+    /// première version de cette fonction copiait littéralement la ligne de
+    /// `play_one_game` (`if state.player == 0 { v } else { -v }`), correcte
+    /// uniquement là-bas parce que `initial_state()` y fixe toujours le
+    /// joueur 0 au premier ply. Ici l'ancre peut démarrer au joueur 1 (les
+    /// deux tests de ce module le font), donc "point de vue du joueur 0" et
+    /// "point de vue du candidat" divergent — ce test construit une
+    /// position *déjà terminale* dès le ply 0 (aucun MCTS, aucun appel à
+    /// l'arbitre : rapide et entièrement déterministe) où le candidat
+    /// (joueur 1, bloqué par des dômes sur toute case sauf les deux qu'il
+    /// occupe) perd immédiatement. L'ancien code aurait renvoyé `+1`
+    /// (puisque `state.player == 1 != 0`) ; la convention corrigée doit
+    /// renvoyer `-1` (le candidat a perdu).
+    #[test]
+    fn outcome_is_relative_to_the_candidate_not_to_player_zero() {
+        let mut initial = State { player: 1, ..Default::default() };
+        initial.workers = [[0, 1, -1, -1], [12, 13, -1, -1]];
+        initial.domes = !0u32 & !((1 << 12) | (1 << 13));
+        let mut evaluator = UniformEvaluator;
+        let record = play_one_game_vs_reference(initial, 4, &mut evaluator, 0.05, true, 1);
+        assert_eq!(record.positions.len(), 0, "position déjà terminale au ply 0 : aucun coup à enregistrer");
+        assert_eq!(record.outcome, -1, "le candidat (joueur 1) est bloqué dès le départ : il doit perdre");
     }
 }
 
