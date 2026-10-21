@@ -31,7 +31,7 @@ from pathlib import Path
 
 from santorini.native import encode
 
-from santoni_az.anchor_pilot import AnchorPilotOrchestrator
+from santoni_az.anchor_pilot import AnchorPilotOrchestrator, WIN_RATE_THRESHOLD
 from tools.mcts_az_vs_reference_campaign import CORPUS, freeze_reference
 from tools.proven_anchor.anchor_games import play_reference_vs_reference
 
@@ -95,6 +95,24 @@ def prepare_anchor(out_dir: Path, opening_job: dict, back_plies: int, seconds: f
         )
     anchor = positions[index]
 
+    # `positions[-1].player` is always the *loser* of the seed game (a
+    # winning move sets `after.player = 1 - mover`, so the player left to
+    # move at the terminal position is the one with no legal move left),
+    # which means `positions[-1 - k].player` is the actual winner's side
+    # only for odd `k`. `back_plies` is a re-tunable CLI flag (not hard
+    # -coded -- spec Sec 3.1); an even value would silently anchor the
+    # candidate onto the *losing* side with no error anywhere, training and
+    # evaluating it on a position it can never win -- indistinguishable
+    # from "the pilot's hypothesis failed". Fail loudly here instead,
+    # naming both the `back_plies` value used and the seed game's actual
+    # winner, so a bad flag value is obvious immediately rather than hours
+    # into a campaign that can never succeed.
+    assert anchor.player == positions[-1].winner, (
+        f'anchor position (back_plies={back_plies}) has player={anchor.player} to move, '
+        f'but the seed game was actually won by player {positions[-1].winner} -- an even '
+        f'back_plies anchors the candidate onto the losing side; use an odd back_plies value'
+    )
+
     state = encode(anchor)
     _atomic_write_bytes(state_path, bytes(state))
 
@@ -104,6 +122,7 @@ def prepare_anchor(out_dir: Path, opening_job: dict, back_plies: int, seconds: f
         'back_plies': back_plies,
         'seed_game_plies': len(positions),
         'anchor_player': anchor.player,
+        'winner': positions[-1].winner,
     }
     tmp_manifest = manifest_path.with_suffix(manifest_path.suffix + '.tmp')
     tmp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
@@ -307,6 +326,21 @@ def main():
                   f"eval_win_rate={eval_win_rate_str} "
                   f"eval_ci_lower={eval_ci_str} "
                   f"workers_alive={status['workers_alive']}", flush=True)
+            # Spec Sec 3.3 ("tourne jusqu'à ce que le seuil ... soit atteint
+            # ou que l'utilisateur l'interrompe"): the threshold is its own
+            # legitimate stop condition, distinct from the separate "no
+            # automatic ceiling for non-convergence" rule (Global
+            # Constraints), which only governs the failure-to-converge
+            # case. `break` out of the loop rather than calling
+            # `orchestrator.stop()` here directly, so the `finally` block
+            # below remains the single call site -- a signal arriving
+            # concurrently with this branch can never race a second
+            # `.stop()` call.
+            if eval_ci_lower is not None and eval_ci_lower >= WIN_RATE_THRESHOLD:
+                print(f"THRESHOLD REACHED: eval_ci_lower={eval_ci_lower:.3f} >= "
+                      f"{WIN_RATE_THRESHOLD:.3f} after {status['games_available']} "
+                      f"training games", flush=True)
+                break
     finally:
         print('stop requested, shutting down cleanly...', flush=True)
         orchestrator.stop()

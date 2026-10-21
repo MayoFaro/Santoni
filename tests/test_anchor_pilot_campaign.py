@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import os
@@ -12,9 +13,20 @@ from tools.anchor_pilot_campaign import freeze_worker_binary, prepare_anchor
 
 def fake_game(count, first_player=0):
     """A list of `count` distinct positions, player alternating per ply, so
-    a wrong index picks a position with the wrong `player` too."""
-    return [Position(workers=((i % 24, (i + 1) % 24), (20, 21)), player=(first_player + i) % 2)
-            for i in range(count)]
+    a wrong index picks a position with the wrong `player` too. The real
+    engine's terminal position always leaves the *loser* to move (a winning
+    move sets `after.player = 1 - mover`), so the last position's `winner`
+    is set here to the complement of its own `player`, matching that
+    real-world invariant -- `prepare_anchor`'s `back_plies`-parity assertion
+    (Fix 2, I3) depends on it."""
+    positions = [
+        Position(workers=((i % 24, (i + 1) % 24), (20, 21)), player=(first_player + i) % 2)
+        for i in range(count)
+    ]
+    if positions:
+        last = positions[-1]
+        positions[-1] = dataclasses.replace(last, winner=1 - last.player)
+    return positions
 
 
 def test_prepare_anchor_writes_the_position_back_plies_before_the_win(tmp_path, monkeypatch):
@@ -132,6 +144,59 @@ def test_prepare_anchor_raises_with_exactly_back_plies_positions(tmp_path, monke
                        reference_binary='frozen-ref')
 
     assert not (tmp_path / 'anchor_state.bin').exists()
+
+
+def test_prepare_anchor_rejects_an_even_back_plies_that_anchors_the_losing_side(tmp_path, monkeypatch):
+    """Fix 2 (review finding I3): `positions[-1].player` is always the
+    *loser* of the seed game (a winning move sets `after.player = 1 -
+    mover`), so `positions[-1 - k].player` is the actual winner's side only
+    for odd `k`. `back_plies` is a re-tunable CLI flag (default 5, odd) --
+    an even value must fail loudly here rather than silently anchoring the
+    candidate on a position it can never win."""
+    import tools.anchor_pilot_campaign as mod
+
+    positions = fake_game(10)  # back_plies=4 -> index = 10 - 1 - 4 = 5, same parity as the loser.
+
+    def fake_play(opening_job, seconds, reference_binary, progress=None):
+        return positions
+
+    monkeypatch.setattr(mod, 'play_reference_vs_reference', fake_play)
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    with pytest.raises(AssertionError) as excinfo:
+        prepare_anchor(tmp_path, opening_job, back_plies=4, seconds=0.1,
+                       reference_binary='frozen-ref')
+
+    message = str(excinfo.value)
+    # The message must name both the `back_plies` value used and the seed
+    # game's actual winner -- that is the whole point of failing loudly
+    # instead of silently, so someone debugging a bad --back-plies value
+    # has something to go on.
+    assert 'back_plies=4' in message
+    assert f'player {positions[-1].winner}' in message
+    assert not (tmp_path / 'anchor_state.bin').exists()
+
+
+def test_prepare_anchor_records_the_seed_games_winner_in_the_manifest(tmp_path, monkeypatch):
+    """Fix 2 (review finding I3): the game's actual winner is recorded in
+    `anchor_manifest.json` for later inspection even when the assertion
+    above doesn't fire -- i.e. on the normal, correct (odd `back_plies`)
+    path."""
+    import tools.anchor_pilot_campaign as mod
+
+    positions = fake_game(10)
+
+    def fake_play(opening_job, seconds, reference_binary, progress=None):
+        return positions
+
+    monkeypatch.setattr(mod, 'play_reference_vs_reference', fake_play)
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    prepare_anchor(tmp_path, opening_job, back_plies=5, seconds=0.1,
+                   reference_binary='frozen-ref')
+
+    manifest = json.loads((tmp_path / mod.ANCHOR_MANIFEST_FILENAME).read_text())
+    assert manifest['winner'] == positions[-1].winner
 
 
 def test_freeze_worker_binary_copies_and_records_sha256(tmp_path, monkeypatch):
@@ -443,3 +508,75 @@ def test_main_calls_stop_even_when_the_supervise_loop_raises(tmp_path, monkeypat
         mod.main()
 
     assert calls == ['start', 'stop']
+
+
+def test_main_announces_and_stops_once_the_win_rate_threshold_is_reached(tmp_path, monkeypatch, capsys):
+    """Fix 1 (review findings C1/I2): nothing in the code actually evaluated
+    the success gate -- the status loop printed `eval_ci_lower` but never
+    compared it to anything, so a human watching the log had no clear
+    signal when the campaign succeeded. `status()` is faked to return an
+    escalating sequence of `eval_ci_lower` values, ending at/above
+    `WIN_RATE_THRESHOLD` (0.90, per the user's 2026-10-21 decision to lower
+    the threshold rather than widen `EVAL_WINDOW`) -- once reached, `main()`
+    must print an unmissable announcement and stop the campaign cleanly,
+    with `stop()` called exactly once (not raced by the signal handler,
+    which is never fired here)."""
+    import tools.anchor_pilot_campaign as mod
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    corpus_path = tmp_path / 'corpus.json'
+    corpus_path.write_text(json.dumps({'jobs': [opening_job], 'seed': 1}))
+
+    monkeypatch.setattr(mod, 'freeze_reference',
+                         lambda out_dir: (tmp_path / 'frozen_reference.so', {'engine_sha256': 'x'}))
+    monkeypatch.setattr(mod, 'freeze_worker_binary', lambda out_dir: (tmp_path / 'frozen_worker', 'y'))
+    monkeypatch.setattr(mod, 'prepare_anchor',
+                         lambda *a, **kw: tmp_path / 'anchor_state.bin')
+
+    # Below threshold, then at/above it on the third call.
+    eval_ci_sequence = [0.50, 0.80, 0.912]
+    calls = []
+    status_calls = {'n': 0}
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            calls.append('start')
+
+        def stop(self):
+            calls.append('stop')
+
+        def status(self):
+            eval_ci_lower = eval_ci_sequence[status_calls['n']]
+            status_calls['n'] += 1
+            calls.append('status')
+            return {'generation': 1, 'last_loss': 0.5, 'games_available': 123,
+                     'eval_games_available': 80, 'workers_alive': 2, 'eval_wins': 37,
+                     'eval_n': 40, 'eval_ci_lower': eval_ci_lower}
+
+    monkeypatch.setattr(mod, 'AnchorPilotOrchestrator', FakeOrchestrator)
+
+    # The signal handler is registered but never fired: the loop must exit
+    # on its own once the threshold is reached, not because of a signal.
+    monkeypatch.setattr(mod.signal, 'signal', lambda sig, handler: None)
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    argv = ['anchor_pilot_campaign', '--out', str(tmp_path / 'out'), '--corpus', str(corpus_path),
+            '--train-workers', '1', '--eval-workers', '1']
+    monkeypatch.setattr('sys.argv', argv)
+
+    mod.main()
+
+    # Exactly one `stop()` call: the threshold-reached `break` must hand off
+    # to the single `finally`-block call site, never call `.stop()` itself.
+    assert calls.count('stop') == 1
+    assert calls.count('status') == 3
+    assert calls[-1] == 'stop'
+
+    out = capsys.readouterr().out
+    assert 'THRESHOLD REACHED' in out
+    assert 'eval_ci_lower=0.912' in out
+    assert '0.900' in out
+    assert 'after 123 training games' in out

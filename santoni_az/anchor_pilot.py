@@ -44,6 +44,17 @@ MIN_CHECKPOINT_INTERVAL_S = 5.0
 # the run.
 EVAL_WINDOW = 40
 
+# Win-rate gate `status()["eval_ci_lower"]` is compared against to declare
+# this campaign successful (spec Sec 3.3). The spec's original figure was
+# 0.95, but at EVAL_WINDOW=40 a Clopper-Pearson 95% lower bound is
+# mathematically unreachable even with a flawless record: 40/40 only
+# reaches clopper_pearson_lower_bound(40, 40) == 0.9119. Decided 2026-10-21
+# (user, final review C1/I2): keep the window at 40 and lower the threshold
+# to 0.90 instead of widening the window. This is still a demanding, near
+# -flawless bar at n=40 -- 40/40 clears it (0.9119) but 39/40 does not
+# (0.8684) -- that is an accepted consequence of this choice, not a bug.
+WIN_RATE_THRESHOLD = 0.90
+
 
 class AnchorPilotOrchestrator:
     def __init__(self, run_dir, anchor_state_path, worker_binary_path,
@@ -140,8 +151,27 @@ class AnchorPilotOrchestrator:
             proc.send_signal(signal.SIGINT)
         for proc in all_workers:
             # Same bound as `Orchestrator.stop()`: the worker only notices
-            # SIGINT between games, never mid-game.
-            proc.wait(timeout=60)
+            # SIGINT between games, never mid-game. That bound (~28s worst
+            # case) was measured for plain self-play; a `--vs-reference`
+            # game's in-flight reference move can plausibly run longer
+            # (scales with `reference_seconds` times the reference's own
+            # ply count), so a 60s wait can plausibly expire here. A bare
+            # `wait(timeout=60)` would let `subprocess.TimeoutExpired`
+            # escape `stop()` entirely, skipping the wait on every
+            # remaining worker *and* skipping `InferenceServer.stop()`
+            # below -- defeating the "interruptible without data loss"
+            # requirement at exactly the moment it matters most (review
+            # finding I4). Catch it per-process instead: escalate to
+            # `kill()` and reap with an unbounded `wait()` (the process is
+            # already dead or dying at that point, so this cannot itself
+            # hang), so one slow worker can never prevent the others from
+            # being waited on or the inference server from being stopped
+            # afterward.
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
         if self._server:
             self._server.stop()
 
