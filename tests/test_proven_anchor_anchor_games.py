@@ -92,8 +92,8 @@ def test_find_anchor_games_rejects_a_second_game_with_an_identical_qualifying_po
         2: ['genuinely-different-position'],
     }
     monkeypatch.setattr(mod, 'play_reference_vs_reference',
-                        lambda job, seconds, binary: histories[job['id']])
-    monkeypatch.setattr(mod, 'scan_game_for_forced_win', lambda positions, d, s: 0)
+                        lambda job, seconds, binary, progress=None: histories[job['id']])
+    monkeypatch.setattr(mod, 'scan_game_for_forced_win', lambda positions, d, s, progress=None: 0)
 
     result = find_anchor_games([{'id': i} for i in range(3)], target_distance=2,
                                 seconds=0.1, reference_binary='unused', minimum=2)
@@ -167,11 +167,11 @@ def test_find_anchor_games_stops_once_minimum_found(monkeypatch):
 
     played = []
 
-    def fake_play(opening_job, seconds, reference_binary):
+    def fake_play(opening_job, seconds, reference_binary, progress=None):
         played.append(opening_job['id'])
         return [f"pos-{opening_job['id']}"]
 
-    def fake_scan(positions, target_distance, seconds):
+    def fake_scan(positions, target_distance, seconds, progress=None):
         return 0  # every opening "qualifies" immediately
 
     monkeypatch.setattr(mod, 'play_reference_vs_reference', fake_play)
@@ -192,11 +192,11 @@ def test_find_anchor_games_raises_when_openings_exhausted_without_reaching_minim
 
     played = []
 
-    def fake_play(opening_job, seconds, reference_binary):
+    def fake_play(opening_job, seconds, reference_binary, progress=None):
         played.append(opening_job['id'])
         return ['only-position']
 
-    def fake_scan(positions, target_distance, seconds):
+    def fake_scan(positions, target_distance, seconds, progress=None):
         return None  # never qualifies
 
     monkeypatch.setattr(mod, 'play_reference_vs_reference', fake_play)
@@ -209,3 +209,105 @@ def test_find_anchor_games_raises_when_openings_exhausted_without_reaching_minim
 
     # Every opening was tried before giving up.
     assert played == [0, 1, 2]
+
+
+def test_scan_game_for_forced_win_reports_progress_per_ply(monkeypatch):
+    """The 2026-10-21 pending finding: this loop had no progress visibility
+    at all, and a real proof search can spend up to `seconds` per ply --
+    so a caller watching a long run needs to see which ply is being
+    searched, not just silence until the whole game is done."""
+    import tools.proven_anchor.anchor_games as mod
+
+    positions = [Position(workers=((0, 4), (20, 24))) for _ in range(3)]
+
+    def never_proven(position, seconds):
+        class FakeAnalysis:
+            proven = False
+            score = 0
+        return FakeAnalysis()
+
+    monkeypatch.setattr(mod, "native_search", never_proven)
+
+    messages = []
+    scan_game_for_forced_win(positions, target_distance=6, seconds=0.1,
+                              progress=messages.append)
+
+    assert len(messages) == 3  # one report per position scanned
+    assert "1/3" in messages[0]
+    assert "3/3" in messages[-1]
+
+
+def test_scan_game_for_forced_win_default_progress_does_not_raise(monkeypatch):
+    """No `progress=` passed at all (every pre-existing call site, and
+    every other test in this file) must keep working -- the default
+    reports to stdout rather than requiring every caller to opt in."""
+    import tools.proven_anchor.anchor_games as mod
+
+    positions = [Position(workers=((0, 4), (20, 24)))]
+
+    def never_proven(position, seconds):
+        class FakeAnalysis:
+            proven = False
+            score = 0
+        return FakeAnalysis()
+
+    monkeypatch.setattr(mod, "native_search", never_proven)
+
+    assert scan_game_for_forced_win(positions, target_distance=6, seconds=0.1) is None
+
+
+def test_play_reference_vs_reference_reports_progress_per_move(monkeypatch):
+    import tools.proven_anchor.anchor_games as mod
+
+    start = Position(workers=((0, 4), (20, 24)), powers=(0, 0), player=0)
+    stuck_after_one = boxed_in_position(stuck_player=1)
+
+    monkeypatch.setattr(mod, 'validate_setup', lambda *a, **k: start)
+
+    def fake_reference_move(position, seconds, reference_binary):
+        class FakeTurn:
+            after = stuck_after_one
+        return FakeTurn(), 12.5
+
+    monkeypatch.setattr(mod, 'reference_move', fake_reference_move)
+
+    messages = []
+    opening_job = {'workers': [[0, 4], [20, 24]], 'powers': [0, 0], 'first': 0}
+    play_reference_vs_reference(opening_job, seconds=0.1, reference_binary='frozen-ref',
+                                 progress=messages.append)
+
+    assert any('12.5' in message for message in messages)
+
+
+def test_find_anchor_games_reports_progress_per_opening_and_forwards_to_sub_calls(monkeypatch):
+    """Each opening's own play/scan progress must still surface (prefixed
+    so a long run's log line can be told apart by opening), alongside a
+    summary line per opening of how many anchors have been found so far."""
+    import tools.proven_anchor.anchor_games as mod
+
+    def fake_play(opening_job, seconds, reference_binary, progress=None):
+        if progress is not None:
+            progress('inner-play')
+        return [f"pos-{opening_job['id']}"]
+
+    def fake_scan(positions, target_distance, seconds, progress=None):
+        if progress is not None:
+            progress('inner-scan')
+        return 0 if positions == ['pos-1'] else None
+
+    monkeypatch.setattr(mod, 'play_reference_vs_reference', fake_play)
+    monkeypatch.setattr(mod, 'scan_game_for_forced_win', fake_scan)
+
+    messages = []
+    openings = [{'id': i} for i in range(2)]
+    result = find_anchor_games(openings, target_distance=2, seconds=0.1,
+                                reference_binary='unused', minimum=1,
+                                progress=messages.append)
+
+    assert result == [(['pos-1'], 0)]
+    joined = '\n'.join(messages)
+    assert 'inner-play' in joined
+    assert 'inner-scan' in joined
+    assert '1/2' in joined  # opening 1 of 2 openings
+    assert '0/1' in joined  # 0 anchors found so far when opening 0 was tried
+    assert any('1/1' in message for message in messages[-2:])  # anchor found, 1/1 needed
