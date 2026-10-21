@@ -21,7 +21,9 @@ functions to this same module; keep this one and its helpers self-contained
 rather than reaching for functions that don't exist yet."""
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 from santorini.native import encode
@@ -30,6 +32,11 @@ from tools.proven_anchor.anchor_games import play_reference_vs_reference
 
 ANCHOR_STATE_FILENAME = 'anchor_state.bin'
 ANCHOR_MANIFEST_FILENAME = 'anchor_manifest.json'
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKER_BINARY = ROOT / 'native_engine' / 'target' / 'release' / 'selfplay_worker'
+WORKER_FROZEN_FILENAME = 'selfplay_worker'
+WORKER_MANIFEST_FILENAME = 'worker_manifest.json'
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -98,3 +105,57 @@ def prepare_anchor(out_dir: Path, opening_job: dict, back_plies: int, seconds: f
     tmp_manifest.replace(manifest_path)
 
     return state_path
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def freeze_worker_binary(out_dir: Path) -> tuple[Path, str]:
+    """Snapshot the compiled `selfplay_worker` currently at `WORKER_BINARY`
+    (today's live `native_engine/target/release` build) into `out_dir`, the
+    same provenance-pin rationale as `tools.mcts_az_vs_reference_campaign
+    .freeze_reference`/`freeze_checkpoint` applied to the worker binary this
+    live pilot actually shells out to: pin precisely what was measured, so a
+    `native_engine` rebuild mid-campaign can never silently blend old and
+    new engine behaviour into one run.
+
+    On the first call, copies `WORKER_BINARY` into `out_dir` and records its
+    sha256 in a manifest. On every call -- including the first, and
+    including later idempotent calls -- hashes the *current* on-disk
+    `WORKER_BINARY` and compares it against the hash recorded in the
+    manifest. This chantier already shipped `freeze_checkpoint` once with a
+    bug where it only compared the frozen copy's hash to itself, which
+    never notices a `--checkpoint` pointed at a different file on a resumed
+    run (see that function's own fix comment); hashing the frozen copy
+    alone here would reproduce exactly that bug for the worker binary, so
+    this hashes `WORKER_BINARY` itself every time instead. A mismatch
+    raises `ValueError` naming both the frozen generation's hash and the
+    current on-disk hash, rather than silently continuing to serve the
+    stale frozen copy under the old provenance record.
+
+    Cheap and side-effect-free when nothing changed: an already-frozen,
+    unchanged binary costs one hash of `WORKER_BINARY` and one manifest
+    read -- the frozen copy is never re-copied once it exists."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frozen = out_dir / WORKER_FROZEN_FILENAME
+    manifest_path = out_dir / WORKER_MANIFEST_FILENAME
+    current_sha256 = _sha256(WORKER_BINARY)
+
+    if not manifest_path.exists():
+        shutil.copy2(WORKER_BINARY, frozen)
+        tmp_manifest = manifest_path.with_suffix(manifest_path.suffix + '.tmp')
+        tmp_manifest.write_text(
+            json.dumps({'worker_sha256': current_sha256}, ensure_ascii=False, indent=2) + '\n')
+        tmp_manifest.replace(manifest_path)
+        return frozen, current_sha256
+
+    frozen_sha256 = json.loads(manifest_path.read_text())['worker_sha256']
+    if current_sha256 != frozen_sha256:
+        raise ValueError(
+            f'selfplay_worker at {WORKER_BINARY} has sha256={current_sha256}, which differs '
+            f'from sha256={frozen_sha256} frozen for this campaign in {out_dir} -- the '
+            f'native_engine binary changed since this campaign started (a rebuild mid-run); '
+            f'choose a new output directory or restore the frozen binary before resuming'
+        )
+    return frozen, frozen_sha256

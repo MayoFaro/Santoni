@@ -1,10 +1,11 @@
+import hashlib
 import json
 
 import pytest
 
 from santorini.engine import Position
 from santorini.native import CState, decode
-from tools.anchor_pilot_campaign import prepare_anchor
+from tools.anchor_pilot_campaign import freeze_worker_binary, prepare_anchor
 
 
 def fake_game(count, first_player=0):
@@ -129,3 +130,64 @@ def test_prepare_anchor_raises_with_exactly_back_plies_positions(tmp_path, monke
                        reference_binary='frozen-ref')
 
     assert not (tmp_path / 'anchor_state.bin').exists()
+
+
+def test_freeze_worker_binary_copies_and_records_sha256(tmp_path, monkeypatch):
+    import tools.anchor_pilot_campaign as mod
+
+    source = tmp_path / 'source_worker'
+    source.write_bytes(b'fake selfplay_worker bytes, generation 1')
+    monkeypatch.setattr(mod, 'WORKER_BINARY', source)
+
+    out_dir = tmp_path / 'out'
+    frozen_path, sha256 = freeze_worker_binary(out_dir)
+
+    assert frozen_path.exists()
+    assert frozen_path.read_bytes() == source.read_bytes()
+    assert sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+
+    manifest_path = out_dir / mod.WORKER_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['worker_sha256'] == sha256
+
+
+def test_freeze_worker_binary_is_idempotent_when_unchanged(tmp_path, monkeypatch):
+    import tools.anchor_pilot_campaign as mod
+
+    source = tmp_path / 'source_worker'
+    source.write_bytes(b'fake selfplay_worker bytes, generation 1')
+    monkeypatch.setattr(mod, 'WORKER_BINARY', source)
+
+    out_dir = tmp_path / 'out'
+    first_path, first_sha256 = freeze_worker_binary(out_dir)
+    frozen_mtime = first_path.stat().st_mtime_ns
+
+    second_path, second_sha256 = freeze_worker_binary(out_dir)
+
+    assert second_path == first_path
+    assert second_sha256 == first_sha256
+    # Déjà figé et inchangé : pas de recopie, donc le fichier figé n'est
+    # jamais réécrit sur un second appel.
+    assert second_path.stat().st_mtime_ns == frozen_mtime
+
+
+def test_freeze_worker_binary_rejects_a_changed_source_binary(tmp_path, monkeypatch):
+    import tools.anchor_pilot_campaign as mod
+
+    source = tmp_path / 'source_worker'
+    source.write_bytes(b'fake selfplay_worker bytes, generation 1')
+    monkeypatch.setattr(mod, 'WORKER_BINARY', source)
+
+    out_dir = tmp_path / 'out'
+    _, frozen_sha256 = freeze_worker_binary(out_dir)
+
+    # Rebuild mid-campaign: the binary at WORKER_BINARY changes on disk.
+    source.write_bytes(b'different bytes after a native_engine rebuild')
+    new_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError) as excinfo:
+        freeze_worker_binary(out_dir)
+
+    message = str(excinfo.value)
+    assert frozen_sha256 in message
+    assert new_sha256 in message
