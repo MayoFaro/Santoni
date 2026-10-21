@@ -74,9 +74,24 @@ class Trainer:
         # Alternance stricte joueur 0 / joueur 1 à chaque ply : vraie pour
         # toute la partie dans le sous-jeu sans pouvoir, où `is_in_scope`
         # (native_engine/src/mcts.rs) impose `powers == [0, 0]` sur toute
-        # position rencontrée. `outcome` est fixé du point de vue du
-        # joueur 0 (cf. `play_one_game`) ; ce signe le reprojette depuis le
-        # point de vue du joueur réellement au trait à ce ply.
+        # position rencontrée. L'invariant réel sur lequel repose cette
+        # ligne n'est PAS « `outcome` est fixé du point de vue du joueur 0 »
+        # — c'est « `outcome` est fixé du point de vue de qui a joué le
+        # ply 0 de la partie ». Les deux producteurs de `GameRecord`
+        # (native_engine/src/bin/selfplay_worker.rs) satisfont cet invariant
+        # chacun pour sa propre raison : `play_one_game` démarre toujours à
+        # `initial_state()`, dont le ply 0 est toujours le joueur 0, donc
+        # « point de vue du ply 0 » et « point de vue du joueur 0 »
+        # coïncident trivialement pour lui ; `play_one_game_vs_reference`
+        # démarre d'une ancre arbitraire (le joueur au ply 0 peut être 0 ou
+        # 1) et fixe explicitement `outcome` du point de vue de
+        # `candidate_player` (toujours le joueur du ply 0 dans ce mode), pas
+        # du joueur 0 physique — une version antérieure confondait les deux
+        # et inversait le signe de chaque exemple d'entraînement pour toute
+        # partie où `candidate_player == 1`. Ne pas « corriger » ce code vers
+        # le joueur 0 physique : ce signe reprojette depuis le point de vue
+        # de qui a joué le ply 0 vers celui du joueur réellement au trait à
+        # ce ply.
         value_target = outcome if ply % 2 == 0 else -outcome
         return planes, policy_target, float(value_target)
 
