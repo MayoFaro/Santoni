@@ -985,17 +985,33 @@ pub unsafe extern "C" fn santoni_search(
 /// already drives via ctypes against the compiled `.so` everywhere else in
 /// this project, and returns its best line's first `CTurn`.
 ///
-/// The `unsafe` here is confined to this function and sound: `state` is a
-/// valid, live `&State`, so `state as *const State` is never dangling or
-/// null, and `santoni_search` only reads through it. `analysis` starts
-/// uninitialised, but `santoni_search` writes `*output` on every path that
-/// returns `0` (including the hidden-information and forced-terminal
-/// branches) before returning — so `assume_init` after checking the status
-/// is `0` reads only fully initialised memory. The two rejection paths
-/// (`-1` malformed `seconds`, `-2` unsupported `state`) never touch
-/// `output`, which is why they are asserted against rather than read.
+/// Three of `santoni_search`'s success paths — terminal position (status 2),
+/// no legal fallback move (status 3), and the forced `extra.event == 1`
+/// branch — report a *sentinel* turn: `length == 0` and `after == *state`,
+/// meaning "no move was made", not a real choice. Callers must check
+/// `turn.length > 0` before reading `turn.actions`; a `length == 0` result
+/// means the engine had nothing to play from this state.
+///
+/// # Panics
+/// Panics (via `santoni_search`'s own input validation, surfaced here as a
+/// non-zero status) if `seconds` is non-finite or outside `0.001..=3600.0`,
+/// or if `state` fails `supported()` (e.g. out-of-range coordinates, a
+/// malformed hero/power combination). Both are caller-controlled
+/// preconditions, not possible outcomes of a normal search.
+///
+/// The `unsafe` here is confined to this function and sound independently of
+/// `santoni_search`'s internals: `state` is a valid, live `&State`, so
+/// `state as *const State` is never dangling or null. `analysis` is built
+/// with `MaybeUninit::zeroed()` rather than `uninit()` — `CAnalysis` is
+/// entirely plain-old-data (every leaf field across `CAnalysis`, `CTurn`,
+/// `Action`, `State`, `Extra`, `Resume`/`Snapshot` is an integer or float;
+/// no enums, bools, or `NonZero` types), so the all-zero bit pattern is
+/// already a legal value of the type. `assume_init()` is therefore sound
+/// even if a future edit to `santoni_search` ever skipped writing `*output`
+/// on some path — the `assert_eq!` below is kept as the semantic guard
+/// (catching a rejected call), not as a soundness requirement.
 pub fn reference_turn(state: &State, seconds: f64) -> CTurn {
-    let mut analysis = std::mem::MaybeUninit::<CAnalysis>::uninit();
+    let mut analysis = std::mem::MaybeUninit::<CAnalysis>::zeroed();
     let status = unsafe {
         santoni_search(
             state as *const State,
