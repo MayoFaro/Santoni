@@ -328,6 +328,137 @@ fn play_one_game(simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, r
     }
 }
 
+/// Mode « contre arbitre » (chantier de l'ancre prouvée en direct, Task 4) :
+/// un seul camp, `candidate_player`, est joué par MCTS+NN exactement comme
+/// dans `play_one_game` ci-dessus ; l'autre camp est joué par l'arbitre
+/// alpha-bêta en process via `reference_turn` (Task 3), depuis une position
+/// de départ `initial` quelconque fournie par l'appelant plutôt que
+/// l'ouverture fixe de `initial_state()`. Produit les données
+/// d'entraînement d'une future tâche d'orchestrateur.
+///
+/// `candidate_player` est capturé **une seule fois**, à partir d'`initial.player`,
+/// avant la boucle — jamais re-dérivé depuis `state.player` à chaque ply.
+/// `state.player` alterne à chaque tour (comme partout ailleurs dans le
+/// sous-jeu sans pouvoir) : si on relisait "qui est le candidat" depuis
+/// `state.player` courant, on obtiendrait trivialement toujours vrai (le
+/// joueur au trait "est" toujours le candidat par construction), ce qui
+/// ferait jouer le candidat *et* l'arbitre en alternance sur le même camp
+/// physique au lieu de fixer le candidat sur un camp pour toute la partie —
+/// exactement la propriété que ce mode doit garantir pour que les données
+/// produites restent interprétables (quel camp physique a réellement choisi
+/// chaque coup).
+///
+/// Chaque ply, candidat ou arbitre, est poussé dans `positions` dans l'ordre
+/// de jeu, sans jamais filtrer les plys de l'arbitre : `Trainer._decode_position`
+/// (santoni_az/trainer.py) itère `enumerate(data["positions"])` sans
+/// distinguer les deux, donc une partie où l'on omettrait les plys de
+/// l'arbitre désaligne silencieusement l'alternance de signe par ply pour
+/// tout le reste de la partie. Le ply de l'arbitre porte un `PositionRecord`
+/// dégénéré : une seule entrée `(action_idx, 1)`, le poids `1` signifiant
+/// "ce coup unique a été choisi avec certitude" (il n'y a pas de
+/// distribution de visites MCTS à répartir, contrairement au candidat).
+///
+/// Contrairement à `play_one_game`, le bruit de Dirichlet et
+/// l'échantillonnage pondéré par température s'appliquent à **tous** les
+/// plys du candidat tant que `deterministic` est faux, pas seulement aux
+/// `TEMPERATURE_PLIES` premiers : `play_one_game` limite le bruit à
+/// l'ouverture parce que toutes ses parties démarrent du même état fixe
+/// (`initial_state()`) et n'ont besoin de diverger qu'au tout début pour
+/// explorer des trajectoires différentes. Ici, chaque partie démarre déjà
+/// d'une position d'ancre potentiellement différente fournie par
+/// l'appelant ; la diversité recherchée est celle du candidat face à
+/// l'arbitre à *chaque* décision qui lui revient, pas seulement à
+/// l'ouverture d'une partie par ailleurs toujours identique. `deterministic`
+/// désactive les deux (retombant sur l'argmax des visites, comme
+/// `run_single_move`) pour les tests et pour tout usage où la
+/// reproductibilité prime sur la diversité d'entraînement.
+fn play_one_game_vs_reference(
+    initial: State,
+    simulations_per_move: u32,
+    evaluator: &mut dyn LeafEvaluator,
+    reference_seconds: f64,
+    deterministic: bool,
+    rng_seed: u64,
+) -> GameRecord {
+    let candidate_player = initial.player;
+    let mut state = initial;
+    let mut positions = Vec::new();
+    let mut rng = Xorshift64::new(rng_seed);
+    loop {
+        // Même raisonnement que `play_one_game` : vérifier depuis le point
+        // de vue du joueur réellement au trait (`state.player`), pas depuis
+        // un camp fixe, pour que les deux branches (victoire et blocage)
+        // déclenchent correctement quel que soit le camp au trait.
+        if let Some(v) = terminal_value(&state, state.player) {
+            let outcome = if state.player == 0 { v } else { -v };
+            return GameRecord { positions, outcome: outcome as i8 };
+        }
+        let planes = santoni_engine::mcts::encode_planes(&state);
+        if state.player == candidate_player {
+            let mut mcts = Mcts::new(state, 1.5);
+            mcts.ensure_root_expanded(evaluator);
+            if !deterministic {
+                let n_edges = mcts.visit_counts().len();
+                let noise = dirichlet_noise(&mut rng, n_edges, DIRICHLET_ALPHA);
+                mcts.mix_root_noise(&noise, DIRICHLET_EPSILON);
+            }
+            mcts.run(simulations_per_move, LEAF_BATCH_SIZE, evaluator);
+            let counts = mcts.visit_counts();
+            let visits: Vec<(usize, u32)> = counts
+                .iter()
+                .map(|(mv, bld, _after, n)| {
+                    let worker_slot = state.workers[state.player as usize]
+                        .iter()
+                        .position(|&c| c == mv.source)
+                        .unwrap();
+                    (santoni_engine::mcts::action_index(mv, bld, worker_slot), *n)
+                })
+                .collect();
+            let chosen = if deterministic {
+                counts.iter().enumerate().max_by_key(|(_, (_, _, _, n))| *n).unwrap().0
+            } else {
+                let weights: Vec<u32> = counts.iter().map(|(_, _, _, n)| *n).collect();
+                sample_weighted(&mut rng, &weights)
+            };
+            let after = counts[chosen].2;
+            positions.push(PositionRecord { planes, visits });
+            state = after;
+        } else {
+            let turn = santoni_engine::reference_turn(&state, reference_seconds);
+            // `reference_turn`'s documented sentinel (`length == 0`,
+            // `after == state`, cf. lib.rs) means "no move was made" —
+            // terminal position or no-fallback path. The `terminal_value`
+            // check at the top of this loop iteration already catches a
+            // genuinely terminal position before we ever get here, so
+            // seeing the sentinel at this point would mean that check
+            // disagreed with the full engine's own terminal detection — a
+            // logic bug, not a case to silently paper over by looping
+            // forever on an unchanged `state`. Fail loudly instead.
+            assert!(
+                turn.length > 0,
+                "reference_turn renvoie le sentinelle « aucun coup » sur une position que terminal_value n'a pas détectée comme terminale"
+            );
+            let mv = turn.actions[0];
+            // Même convention factice que `legal_children` (mcts.rs) pour un
+            // tour gagnant à une seule action : une construction qui ne sera
+            // jamais appliquée (l'état `turn.after` est déjà terminal), ne
+            // servant qu'à produire un `action_index` défini.
+            let bld = if turn.length >= 2 {
+                turn.actions[1]
+            } else {
+                Action { kind: 1, player: mv.player, worker: mv.worker, source: mv.target, target: mv.target }
+            };
+            let worker_slot = state.workers[state.player as usize]
+                .iter()
+                .position(|&c| c == mv.source)
+                .unwrap();
+            let visits = vec![(santoni_engine::mcts::action_index(&mv, &bld, worker_slot), 1)];
+            positions.push(PositionRecord { planes, visits });
+            state = turn.after;
+        }
+    }
+}
+
 /// Drapeau d'interruption positionné par le gestionnaire SIGINT et vérifié
 /// uniquement entre deux parties, jamais pendant l'écriture d'un fichier :
 /// l'écriture est déjà atomique par renommage (Task 3), donc le seul
@@ -485,6 +616,54 @@ fn main() {
             None => Box::new(UniformEvaluator),
         };
         run_single_move(&input_state, &output_move, seconds, evaluator.as_mut());
+        return;
+    }
+    if args.iter().any(|a| a == "--vs-reference") {
+        let input_state = PathBuf::from(parse_arg(&args, "--input-state"));
+        let bytes = std::fs::read(&input_state).expect("lecture de l'état d'entrée impossible");
+        assert_eq!(bytes.len(), std::mem::size_of::<State>(), "taille d'état incompatible");
+        // `read_unaligned`, même raisonnement qu'à `run_single_move` /
+        // `run_encode_planes` ci-dessus : aucune garantie d'alignement sur
+        // un `Vec<u8>` issu de `std::fs::read`.
+        let initial: State = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const State) };
+        assert!(
+            santoni_engine::mcts::is_in_scope(&initial),
+            "position d'ancre hors périmètre sans-pouvoir"
+        );
+        let out_dir = PathBuf::from(parse_arg(&args, "--out-dir"));
+        let games: u32 = parse_arg(&args, "--games").parse().unwrap();
+        let simulations_per_move: u32 = parse_arg(&args, "--simulations-per-move").parse().unwrap();
+        let reference_seconds: f64 = parse_arg(&args, "--reference-seconds").parse().unwrap();
+        let deterministic = args.iter().any(|a| a == "--deterministic");
+
+        install_sigint_handler();
+
+        let socket_path = args.iter().position(|a| a == "--inference-socket").map(|i| args[i + 1].clone());
+        let mut evaluator: Box<dyn LeafEvaluator> = match socket_path {
+            Some(path) => Box::new(SocketEvaluator::connect(&path)),
+            None => Box::new(UniformEvaluator),
+        };
+        for i in 0..games {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                break;
+            }
+            let record = play_one_game_vs_reference(
+                initial,
+                simulations_per_move,
+                evaluator.as_mut(),
+                reference_seconds,
+                deterministic,
+                seed_for_game(i),
+            );
+            // Même convention de nom de fichier que le mode self-play continu
+            // ci-dessous (PID + compteur local) : les mêmes raisons
+            // d'unicité entre workers concurrents et de non-collision après
+            // reprise s'appliquent ici à l'identique, et `glob("game-*.json")`
+            // (Trainer, orchestrateur, tests) doit continuer de matcher sans
+            // distinguer les deux modes.
+            let path = out_dir.join(format!("game-{}-{:06}.json", std::process::id(), i));
+            write_game_atomically(&path, &record).expect("écriture de partie impossible");
+        }
         return;
     }
     let games: u32 = parse_arg(&args, "--games").parse().unwrap();
@@ -677,6 +856,28 @@ mod socket_evaluator_tests {
         assert_eq!(second[0].1, 1.5);
         server.join().expect("jointure thread serveur factice");
         let _ = std::fs::remove_file(&socket_path);
+    }
+}
+
+#[cfg(test)]
+mod vs_reference_tests {
+    use super::*;
+
+    #[test]
+    fn every_ply_is_recorded_and_the_candidate_keeps_the_same_physical_player() {
+        let initial = State { workers: [[0, 4, -1, -1], [20, 24, -1, -1]], player: 1, ..Default::default() };
+        let mut evaluator = UniformEvaluator;
+        let record = play_one_game_vs_reference(initial, 4, &mut evaluator, 0.05, true, 1);
+        // Reference plies (degenerate, weight-1 single entry) and candidate
+        // plies (a real MCTS distribution) must strictly alternate starting
+        // with the candidate (player 1, the anchor's own player, moves
+        // first) -- a gap here means a ply was silently dropped from the
+        // record, corrupting Trainer's ply-parity sign convention.
+        for (i, position) in record.positions.iter().enumerate() {
+            let is_reference_ply = position.visits.len() == 1 && position.visits[0].1 == 1;
+            assert_eq!(is_reference_ply, i % 2 == 1, "ply {i} has the wrong record shape");
+        }
+        assert!(record.positions.len() >= 2);
     }
 }
 
