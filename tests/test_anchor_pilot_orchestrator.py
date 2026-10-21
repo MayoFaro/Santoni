@@ -135,6 +135,18 @@ def test_status_reports_none_eval_ci_lower_before_any_eval_game(tmp_path):
 
 
 def test_restart_does_not_lose_already_played_eval_games(tmp_path):
+    """Checks more than the bare `eval_games_available` file count: nothing
+    in this codebase ever deletes a game file, so that count alone is
+    monotonic by construction and would pass even if `status()`'s rolling
+    40-game window (`eval_n`, `eval_wins`, `eval_ci_lower`) were computed
+    from something that forgot the first process's games entirely (e.g. an
+    in-process counter instead of re-scanning `eval_games/` from disk on
+    every call, which is what `_recent_eval_outcomes` actually does).
+    Asserting `eval_n`/`eval_wins` also never decrease across the restart
+    exercises that recomputation-from-disk path directly, on a fresh
+    `AnchorPilotOrchestrator` instance that starts with an empty in-process
+    state and must derive both fields purely from what is already on
+    disk."""
     anchor_path = tmp_path / "anchor_state.bin"
     _write_anchor_state(anchor_path)
 
@@ -143,18 +155,25 @@ def test_restart_does_not_lose_already_played_eval_games(tmp_path):
         train_worker_count=1, eval_worker_count=1, simulations_per_move=4, reference_seconds=0.1,
     )
     orch.start()
-    time.sleep(1.5)
-    orch.stop()
-    eval_n_before = orch.status()["eval_games_available"]
-    assert eval_n_before >= 1
+    try:
+        time.sleep(1.5)
+    finally:
+        orch.stop()
+    before = orch.status()
+    assert before["eval_games_available"] >= 1
+    assert before["eval_n"] >= 1
 
     orch2 = AnchorPilotOrchestrator(
         run_dir=tmp_path, anchor_state_path=anchor_path, worker_binary_path=WORKER_BINARY,
         train_worker_count=1, eval_worker_count=1, simulations_per_move=4, reference_seconds=0.1,
     )
     orch2.start()
-    time.sleep(1.0)
-    eval_n_after = orch2.status()["eval_games_available"]
-    orch2.stop()
+    try:
+        time.sleep(1.0)
+        after = orch2.status()
+    finally:
+        orch2.stop()
 
-    assert eval_n_after >= eval_n_before
+    assert after["eval_games_available"] >= before["eval_games_available"]
+    assert after["eval_n"] >= before["eval_n"]
+    assert after["eval_wins"] >= before["eval_wins"]
