@@ -212,7 +212,12 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
     corpus_path.write_text(json.dumps({'jobs': [opening_job], 'seed': 1}))
 
     frozen_worker_path = tmp_path / 'frozen_worker'
+    frozen_reference_path = tmp_path / 'frozen_reference.so'
     anchor_state_path = tmp_path / 'anchor_state.bin'
+
+    def fake_freeze_reference(out_dir):
+        calls.append(('freeze_reference', out_dir))
+        return frozen_reference_path, {'engine_sha256': 'feedface'}
 
     def fake_freeze_worker_binary(out_dir):
         calls.append(('freeze_worker_binary', out_dir))
@@ -242,6 +247,7 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
                     'eval_games_available': 0, 'workers_alive': 2, 'eval_wins': 0,
                     'eval_n': 0, 'eval_ci_lower': None}
 
+    monkeypatch.setattr(mod, 'freeze_reference', fake_freeze_reference)
     monkeypatch.setattr(mod, 'freeze_worker_binary', fake_freeze_worker_binary)
     monkeypatch.setattr(mod, 'prepare_anchor', fake_prepare_anchor)
     monkeypatch.setattr(mod, 'AnchorPilotOrchestrator', FakeOrchestrator)
@@ -269,11 +275,15 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
     mod.main()
 
     kinds = [c[0] for c in calls]
+    assert kinds.index('freeze_reference') < kinds.index('prepare_anchor')
     assert kinds.index('freeze_worker_binary') < kinds.index('prepare_anchor')
     assert kinds.index('prepare_anchor') < kinds.index('construct')
     assert kinds.index('construct') < kinds.index('start')
     assert kinds.index('start') < kinds.index('status')
     assert kinds.index('status') < kinds.index('stop')
+
+    freeze_reference_call = next(c for c in calls if c[0] == 'freeze_reference')
+    assert freeze_reference_call[1] == out_dir
 
     freeze_call = next(c for c in calls if c[0] == 'freeze_worker_binary')
     assert freeze_call[1] == out_dir
@@ -283,7 +293,11 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
     assert prepare_call[2] == opening_job
     assert prepare_call[3] == 3
     assert prepare_call[4] == 1.5
-    assert prepare_call[5] == frozen_worker_path
+    # `reference_binary` must be the frozen reference *library* (.so), not
+    # the frozen `selfplay_worker` executable -- `set_engine`/`native
+    # .library()` loads it via `ctypes.CDLL`, which cannot dlopen an ELF
+    # executable (see this module's docstring).
+    assert prepare_call[5] == frozen_reference_path
 
     construct_call = next(c for c in calls if c[0] == 'construct')
     assert construct_call[1] == out_dir

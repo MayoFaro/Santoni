@@ -32,7 +32,7 @@ from pathlib import Path
 from santorini.native import encode
 
 from santoni_az.anchor_pilot import AnchorPilotOrchestrator
-from tools.mcts_az_vs_reference_campaign import CORPUS
+from tools.mcts_az_vs_reference_campaign import CORPUS, freeze_reference
 from tools.proven_anchor.anchor_games import play_reference_vs_reference
 
 ANCHOR_STATE_FILENAME = 'anchor_state.bin'
@@ -176,12 +176,21 @@ def main():
     called from, so a signal can never cut off a `.stop()` already in
     progress.
 
-    `reference_binary` is deliberately the just-frozen worker binary's own
-    path, not a separate `freeze_reference` call: both roles (searching the
-    one-time anchor seed game, and every later `--vs-reference` game
-    `AnchorPilotOrchestrator` launches) are served by the same
-    `selfplay_worker`/`native_engine` build in this project (see this
-    module's docstring and `prepare_anchor`'s own docstring)."""
+    Two distinct build artifacts get frozen here, both from today's
+    `native_engine` build, for two distinct roles -- despite the similarly
+    named `freeze_worker_binary`/`freeze_reference`, these are not
+    interchangeable: `prepare_anchor`'s `reference_binary` argument flows
+    into `tools.mcts_az_vs_reference_campaign.reference_move`, which
+    `set_engine`s it and calls `native_search` -- an in-process alpha-beta
+    search through `native.library()`'s `ctypes.CDLL`, which requires the
+    compiled shared library (`libsantoni_engine.so`), never the
+    `selfplay_worker` *executable* (`ctypes.CDLL` on an ELF executable
+    raises `OSError: cannot dynamically load position-independent
+    executable` -- caught by this module's own smoke test). So the one-time
+    anchor search is pinned via `freeze_reference` (the `.so`), while
+    `AnchorPilotOrchestrator`'s every later `--vs-reference` subprocess game
+    is pinned via `freeze_worker_binary` (the `selfplay_worker` binary) --
+    see that function's own docstring."""
     parser = argparse.ArgumentParser(
         description='Live anchor pilot: a candidate MCTS+NN network learns by playing '
                      'against a live reference engine, every game starting from one fixed '
@@ -210,8 +219,14 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
 
-    # Frozen first: `prepare_anchor` below needs this frozen copy's path as
-    # its own `reference_binary` argument (see this function's docstring).
+    # Frozen first: `prepare_anchor` below needs the frozen reference
+    # library's path as its own `reference_binary` argument (see this
+    # function's docstring for why this is a different artifact from the
+    # `selfplay_worker` binary frozen right after).
+    reference_binary_path, reference_manifest = freeze_reference(args.out)
+    print(f"REFERENCE frozen: {reference_binary_path} "
+          f"sha256={reference_manifest['engine_sha256']}", flush=True)
+
     worker_binary_path, worker_sha256 = freeze_worker_binary(args.out)
     print(f'WORKER frozen: {worker_binary_path} sha256={worker_sha256}', flush=True)
 
@@ -223,7 +238,7 @@ def main():
 
     anchor_state_path = prepare_anchor(
         args.out, opening_job, args.back_plies, args.reference_seconds,
-        worker_binary_path, progress=anchor_progress,
+        reference_binary_path, progress=anchor_progress,
     )
     print(f'ANCHOR ready: {anchor_state_path}', flush=True)
 
