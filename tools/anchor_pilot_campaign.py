@@ -21,13 +21,18 @@ functions to this same module; keep this one and its helpers self-contained
 rather than reaching for functions that don't exist yet."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import shutil
+import signal
+import time
 from pathlib import Path
 
 from santorini.native import encode
 
+from santoni_az.anchor_pilot import AnchorPilotOrchestrator
+from tools.mcts_az_vs_reference_campaign import CORPUS
 from tools.proven_anchor.anchor_games import play_reference_vs_reference
 
 ANCHOR_STATE_FILENAME = 'anchor_state.bin'
@@ -159,3 +164,114 @@ def freeze_worker_binary(out_dir: Path) -> tuple[Path, str]:
             f'choose a new output directory or restore the frozen binary before resuming'
         )
     return frozen, frozen_sha256
+
+
+def main():
+    """CLI entrypoint: freeze the worker binary, prepare (or locate) the
+    anchor position, then start and supervise an `AnchorPilotOrchestrator`
+    until a SIGTERM/SIGINT asks for a clean shutdown -- same shape as every
+    other long-running launcher in this chantier (`selfplay-runs/run.py`,
+    `run2.py`): a handler that only *records* the request, a status-printing
+    loop that *reads* that record and is the sole place `.stop()` is ever
+    called from, so a signal can never cut off a `.stop()` already in
+    progress.
+
+    `reference_binary` is deliberately the just-frozen worker binary's own
+    path, not a separate `freeze_reference` call: both roles (searching the
+    one-time anchor seed game, and every later `--vs-reference` game
+    `AnchorPilotOrchestrator` launches) are served by the same
+    `selfplay_worker`/`native_engine` build in this project (see this
+    module's docstring and `prepare_anchor`'s own docstring)."""
+    parser = argparse.ArgumentParser(
+        description='Live anchor pilot: a candidate MCTS+NN network learns by playing '
+                     'against a live reference engine, every game starting from one fixed '
+                     'anchor position (back_plies before a real reference-vs-reference win).'
+    )
+    parser.add_argument('--out', required=True, type=Path,
+                         help='Output directory: anchor state, frozen worker binary, '
+                              'games/eval_games/checkpoints dirs are all written here.')
+    parser.add_argument('--corpus', type=Path, default=CORPUS,
+                         help='No-power opening-job corpus the one-time anchor seed game is '
+                              'sourced from (default: the same corpus '
+                              'tools.mcts_az_vs_reference_campaign uses).')
+    parser.add_argument('--back-plies', type=int, default=5,
+                         help='Plies to walk back from the seed game terminal position to '
+                              'reach the anchor position.')
+    parser.add_argument('--train-workers', type=int, required=True,
+                         help='Number of training (--vs-reference, non-deterministic) workers.')
+    parser.add_argument('--eval-workers', type=int, required=True,
+                         help='Number of eval (--vs-reference --deterministic) workers.')
+    parser.add_argument('--simulations-per-move', type=int, default=32,
+                         help="MCTS simulations per candidate move.")
+    parser.add_argument('--reference-seconds', type=float, default=5.0,
+                         help='Reference engine per-move time budget, both for the one-time '
+                              'anchor seed game and every later --vs-reference game.')
+    args = parser.parse_args()
+
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    # Frozen first: `prepare_anchor` below needs this frozen copy's path as
+    # its own `reference_binary` argument (see this function's docstring).
+    worker_binary_path, worker_sha256 = freeze_worker_binary(args.out)
+    print(f'WORKER frozen: {worker_binary_path} sha256={worker_sha256}', flush=True)
+
+    jobs = json.loads(args.corpus.read_text())['jobs']
+    opening_job = jobs[0]
+
+    def anchor_progress(message):
+        print(f'ANCHOR {message}', flush=True)
+
+    anchor_state_path = prepare_anchor(
+        args.out, opening_job, args.back_plies, args.reference_seconds,
+        worker_binary_path, progress=anchor_progress,
+    )
+    print(f'ANCHOR ready: {anchor_state_path}', flush=True)
+
+    orchestrator = AnchorPilotOrchestrator(
+        args.out, anchor_state_path, worker_binary_path,
+        args.train_workers, args.eval_workers,
+        simulations_per_move=args.simulations_per_move,
+        reference_seconds=args.reference_seconds,
+    )
+
+    # Same pattern as `selfplay-runs/run.py`/`run2.py`: the handler only
+    # flips a flag the status loop below reads every 10s -- `.stop()` is
+    # called exactly once, from the loop, after it observes the flag, never
+    # from inside the signal handler itself.
+    stopping = False
+
+    def handle_term(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    orchestrator.start()
+    print(f'orchestrator started, run_dir={args.out}, '
+          f'train_workers={args.train_workers}, eval_workers={args.eval_workers}', flush=True)
+
+    while not stopping:
+        time.sleep(10)
+        status = orchestrator.status()
+        eval_ci_lower = status['eval_ci_lower']
+        # `eval_ci_lower` is `None` until at least one eval game has
+        # completed -- same "nothing real yet" convention as `last_loss`
+        # (see `AnchorPilotOrchestrator.status`'s own docstring). Formatting
+        # or comparing a `None` against the 0.95 success threshold here
+        # would crash this loop outright, so it prints 'n/a' instead.
+        eval_ci_str = 'n/a' if eval_ci_lower is None else f'{eval_ci_lower:.3f}'
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+              f"generation={status['generation']} "
+              f"games_available={status['games_available']} "
+              f"eval_n={status['eval_n']} "
+              f"eval_ci_lower={eval_ci_str} "
+              f"workers_alive={status['workers_alive']}", flush=True)
+
+    print('stop requested, shutting down cleanly...', flush=True)
+    orchestrator.stop()
+    print('stopped', flush=True)
+
+
+if __name__ == '__main__':
+    main()

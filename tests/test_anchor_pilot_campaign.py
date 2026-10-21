@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import signal
 
 import pytest
 
@@ -191,3 +193,103 @@ def test_freeze_worker_binary_rejects_a_changed_source_binary(tmp_path, monkeypa
     message = str(excinfo.value)
     assert frozen_sha256 in message
     assert new_sha256 in message
+
+
+def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, monkeypatch):
+    """`main()`'s wiring, with no real multi-second run: `prepare_anchor`,
+    `freeze_worker_binary` and `AnchorPilotOrchestrator` are all replaced
+    with fakes that record call order/args, and the status-printing loop is
+    made to exit on its very first iteration by capturing the real
+    `signal.signal` handler registration and invoking the SIGTERM handler
+    directly from the faked `time.sleep` -- deterministic, unlike relying
+    on a real `os.kill`-delivered signal's timing."""
+    import tools.anchor_pilot_campaign as mod
+
+    calls = []
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    corpus_path = tmp_path / 'corpus.json'
+    corpus_path.write_text(json.dumps({'jobs': [opening_job], 'seed': 1}))
+
+    frozen_worker_path = tmp_path / 'frozen_worker'
+    anchor_state_path = tmp_path / 'anchor_state.bin'
+
+    def fake_freeze_worker_binary(out_dir):
+        calls.append(('freeze_worker_binary', out_dir))
+        return frozen_worker_path, 'deadbeef'
+
+    def fake_prepare_anchor(out_dir, job, back_plies, seconds, reference_binary, progress=None):
+        calls.append(('prepare_anchor', out_dir, job, back_plies, seconds, reference_binary))
+        return anchor_state_path
+
+    class FakeOrchestrator:
+        def __init__(self, run_dir, anchor_state_path, worker_binary_path,
+                     train_worker_count, eval_worker_count, simulations_per_move=32,
+                     reference_seconds=5.0):
+            calls.append(('construct', run_dir, anchor_state_path, worker_binary_path,
+                           train_worker_count, eval_worker_count, simulations_per_move,
+                           reference_seconds))
+
+        def start(self):
+            calls.append(('start',))
+
+        def stop(self):
+            calls.append(('stop',))
+
+        def status(self):
+            calls.append(('status',))
+            return {'generation': 0, 'last_loss': None, 'games_available': 0,
+                    'eval_games_available': 0, 'workers_alive': 2, 'eval_wins': 0,
+                    'eval_n': 0, 'eval_ci_lower': None}
+
+    monkeypatch.setattr(mod, 'freeze_worker_binary', fake_freeze_worker_binary)
+    monkeypatch.setattr(mod, 'prepare_anchor', fake_prepare_anchor)
+    monkeypatch.setattr(mod, 'AnchorPilotOrchestrator', FakeOrchestrator)
+
+    handlers = {}
+
+    def fake_signal(sig, handler):
+        handlers[sig] = handler
+
+    monkeypatch.setattr(mod.signal, 'signal', fake_signal)
+
+    def fake_sleep(seconds):
+        # Fire the real SIGTERM handler `main()` registered, directly --
+        # deterministic, no dependency on OS signal-delivery timing.
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(mod.time, 'sleep', fake_sleep)
+
+    out_dir = tmp_path / 'out'
+    argv = ['anchor_pilot_campaign', '--out', str(out_dir), '--corpus', str(corpus_path),
+            '--back-plies', '3', '--train-workers', '4', '--eval-workers', '1',
+            '--simulations-per-move', '16', '--reference-seconds', '1.5']
+    monkeypatch.setattr('sys.argv', argv)
+
+    mod.main()
+
+    kinds = [c[0] for c in calls]
+    assert kinds.index('freeze_worker_binary') < kinds.index('prepare_anchor')
+    assert kinds.index('prepare_anchor') < kinds.index('construct')
+    assert kinds.index('construct') < kinds.index('start')
+    assert kinds.index('start') < kinds.index('status')
+    assert kinds.index('status') < kinds.index('stop')
+
+    freeze_call = next(c for c in calls if c[0] == 'freeze_worker_binary')
+    assert freeze_call[1] == out_dir
+
+    prepare_call = next(c for c in calls if c[0] == 'prepare_anchor')
+    assert prepare_call[1] == out_dir
+    assert prepare_call[2] == opening_job
+    assert prepare_call[3] == 3
+    assert prepare_call[4] == 1.5
+    assert prepare_call[5] == frozen_worker_path
+
+    construct_call = next(c for c in calls if c[0] == 'construct')
+    assert construct_call[1] == out_dir
+    assert construct_call[2] == anchor_state_path
+    assert construct_call[3] == frozen_worker_path
+    assert construct_call[4] == 4
+    assert construct_call[5] == 1
+    assert construct_call[6] == 16
+    assert construct_call[7] == 1.5
