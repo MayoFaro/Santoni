@@ -977,6 +977,42 @@ pub unsafe extern "C" fn santoni_search(
     0
 }
 
+/// In-process twin of `santoni_search` for callers that live in this same
+/// crate (the self-play worker, which plays one side itself while letting
+/// the alpha-beta engine play the other) — no FFI/ctypes/subprocess
+/// round trip, just a direct Rust call. No search logic is duplicated: this
+/// calls the exact same `santoni_search` that `native.py`'s `native_search`
+/// already drives via ctypes against the compiled `.so` everywhere else in
+/// this project, and returns its best line's first `CTurn`.
+///
+/// The `unsafe` here is confined to this function and sound: `state` is a
+/// valid, live `&State`, so `state as *const State` is never dangling or
+/// null, and `santoni_search` only reads through it. `analysis` starts
+/// uninitialised, but `santoni_search` writes `*output` on every path that
+/// returns `0` (including the hidden-information and forced-terminal
+/// branches) before returning — so `assume_init` after checking the status
+/// is `0` reads only fully initialised memory. The two rejection paths
+/// (`-1` malformed `seconds`, `-2` unsupported `state`) never touch
+/// `output`, which is why they are asserted against rather than read.
+pub fn reference_turn(state: &State, seconds: f64) -> CTurn {
+    let mut analysis = std::mem::MaybeUninit::<CAnalysis>::uninit();
+    let status = unsafe {
+        santoni_search(
+            state as *const State,
+            seconds,
+            analysis.as_mut_ptr(),
+            None,
+            None,
+        )
+    };
+    assert_eq!(
+        status, 0,
+        "santoni_search rejected the state or seconds (status {status})"
+    );
+    let analysis = unsafe { analysis.assume_init() };
+    analysis.turns[0]
+}
+
 /// Differential-test interface. Returns required capacity, or usize::MAX on
 /// invalid input. Only writes as many CTurn values as the caller allocated.
 #[no_mangle]
@@ -1406,6 +1442,13 @@ mod tests {
         search.store(key, dummy_entry(3));
         let cached = search.table.get(&key).cloned().unwrap();
         assert!(Rc::ptr_eq(&search.table[&key].line, &cached.line));
+    }
+    #[test]
+    fn reference_turn_returns_a_legal_turn_for_a_simple_no_power_position() {
+        let state = State { workers: [[0, 4, -1, -1], [20, 24, -1, -1]], ..Default::default() };
+        let turn = reference_turn(&state, 0.2);
+        assert!(turn.length == 1 || turn.length == 2);
+        assert_ne!(turn.after, state); // a real move happened
     }
     #[cfg(feature = "profile")]
     #[test]
