@@ -42,21 +42,21 @@
 - Consumes: nothing new.
 - Produces: `find_anchor_games(..., progress=_progress)` now forwards a prefixed `progress` into `play_reference_vs_reference`/`scan_game_for_forced_win` and reports one summary line per opening tried — used by Task 5's `prepare_anchor` for visibility into the one-time seed-game generation.
 
-- [ ] **Step 1: Confirm the existing failing test still fails for the right reason**
+- [x] **Step 1: Confirm the existing failing test still fails for the right reason**
 
 Run: `python3 -m pytest tests/test_proven_anchor_anchor_games.py::test_find_anchor_games_reports_progress_per_opening_and_forwards_to_sub_calls -v`
 Expected: FAIL — `'inner-play' in joined` assertion error (progress never forwarded).
 
-- [ ] **Step 2: Implement the forwarding in `find_anchor_games`**
+- [x] **Step 2: Implement the forwarding in `find_anchor_games`**
 
 For each opening in `openings`, build a scoped progress function that prefixes `play_reference_vs_reference`'s and `scan_game_for_forced_win`'s own messages with the opening's 1-based index and the total count (e.g. `f"[opening {i+1}/{len(openings)}] {message}"`), pass it as `progress=` to both calls, and after each opening emit one summary line reporting anchors found so far vs. `minimum` (matching the test's `'1/2'`, `'0/1'`, `'1/1'` assertions).
 
-- [ ] **Step 3: Run the full test file and verify all green**
+- [x] **Step 3: Run the full test file and verify all green**
 
 Run: `python3 -m pytest tests/test_proven_anchor_anchor_games.py -v`
 Expected: all PASS (13 tests).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tools/proven_anchor/anchor_games.py tests/test_proven_anchor_anchor_games.py
@@ -72,7 +72,7 @@ git commit -m "feat: progress visibility for anchor-game search and seed-game ge
 **Interfaces:**
 - Produces: `clopper_pearson_lower_bound(successes: int, n: int, confidence: float = 0.95) -> float`. Raises `ValueError` if `n <= 0`, `successes < 0`, or `successes > n`. Used by Task 7's `AnchorPilotOrchestrator.status()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_zero_successes_gives_zero_lower_bound():
@@ -98,21 +98,21 @@ def test_rejects_successes_greater_than_n():
         clopper_pearson_lower_bound(5, 4)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m pytest tests/test_stats.py -v`
 Expected: FAIL with `ModuleNotFoundError` / `ImportError` (module doesn't exist yet).
 
-- [ ] **Step 3: Implement `clopper_pearson_lower_bound` in `santoni_az/stats.py`**
+- [x] **Step 3: Implement `clopper_pearson_lower_bound` in `santoni_az/stats.py`**
 
 Binary-search `p` in `[0, 1]` for the value where the binomial survival function `sum(math.comb(n, i) * p**i * (1 - p)**(n - i) for i in range(successes, n + 1))` crosses `confidence`'s complement halved (`(1 - confidence) / 2`) — the survival function is monotonically increasing in `p`, so a plain bisection to a tight tolerance (e.g. 1e-10) is sufficient; no scipy, no new dependency. `successes == 0` returns `0.0` directly (the survival function is identically 1 for every `p > 0`, so no crossing exists to search for).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_stats.py -v`
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add santoni_az/stats.py tests/test_stats.py
@@ -127,7 +127,7 @@ git commit -m "feat: add Clopper-Pearson lower bound for the anchor pilot's win-
 **Interfaces:**
 - Produces: `pub fn reference_turn(state: &State, seconds: f64) -> CTurn` — the best line's first `CTurn` (`.actions[..length]` plus `.after`), computed by calling the existing `santoni_search` in-process (no FFI/socket round trip). Used by Task 4's new worker mode.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the existing `#[cfg(test)] mod tests` block in `lib.rs` (same module the other `santoni_search`-adjacent tests already live in):
 
@@ -141,21 +141,21 @@ fn reference_turn_returns_a_legal_turn_for_a_simple_no_power_position() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd native_engine && cargo test reference_turn_returns_a_legal_turn`
 Expected: FAIL — `reference_turn` not defined.
 
-- [ ] **Step 3: Implement `reference_turn`**
+- [x] **Step 3: Implement `reference_turn`**
 
 Build a `CState`-compatible raw pointer to `state` (same pattern `santoni_search`'s own callers already use at the FFI boundary — here entirely in-process, no `unsafe extern "C"` crossing needed beyond what calling `santoni_search` itself requires), call `santoni_search(state_ptr, seconds, &mut analysis, None, None)`, and return `analysis.turns[0]`. This is a thin wrapper — no search logic is duplicated; it reuses the exact same alpha-beta code path `native_search` already calls via ctypes everywhere else in this project.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd native_engine && cargo test reference_turn_returns_a_legal_turn`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add native_engine/src/lib.rs
@@ -172,7 +172,7 @@ git commit -m "feat: expose an in-process reference turn for the self-play worke
 - Consumes: `santoni_engine::reference_turn` (Task 3), `santoni_engine::mcts::action_index` (existing, already used by `play_one_game`).
 - Produces: CLI mode `--vs-reference --input-state <path> --out-dir <dir> --games <n> --simulations-per-move <n> --inference-socket <path> --reference-seconds <f64> [--deterministic]`, writing `GameRecord`s via the existing `write_game_atomically` with the existing `game-{pid}-{counter:06}.json` naming (same convention continuous self-play already uses, so `Trainer`/tests' `glob("game-*.json")` keeps matching unchanged). Internally: `fn play_one_game_vs_reference(initial: State, simulations_per_move: u32, evaluator: &mut dyn LeafEvaluator, reference_seconds: f64, deterministic: bool, rng_seed: u64) -> GameRecord`.
 
-- [ ] **Step 1: Write the failing Python end-to-end test (defines the external CLI contract first)**
+- [x] **Step 1: Write the failing Python end-to-end test (defines the external CLI contract first)**
 
 In `tests/test_selfplay_end_to_end.py`, add (mirroring `test_worker_produces_games_via_real_inference_server`'s existing setup):
 
@@ -200,12 +200,12 @@ def test_vs_reference_mode_produces_games_with_every_ply_recorded(tmp_path):
             assert count == 1 and data["positions"][i]["visits"][0][1] == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m pytest tests/test_selfplay_end_to_end.py::test_vs_reference_mode_produces_games_with_every_ply_recorded -v`
 Expected: FAIL — `--vs-reference` not recognized by the current binary (returncode != 0).
 
-- [ ] **Step 3: Write the failing Rust unit test**
+- [x] **Step 3: Write the failing Rust unit test**
 
 Add to a new `#[cfg(test)] mod vs_reference_tests` in `selfplay_worker.rs`:
 
@@ -228,31 +228,31 @@ fn every_ply_is_recorded_and_the_candidate_keeps_the_same_physical_player() {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it fails**
+- [x] **Step 4: Run test to verify it fails**
 
 Run: `cd native_engine && cargo test every_ply_is_recorded_and_the_candidate_keeps`
 Expected: FAIL — `play_one_game_vs_reference` not defined.
 
-- [ ] **Step 5: Implement `play_one_game_vs_reference` and the `--vs-reference` CLI dispatch**
+- [x] **Step 5: Implement `play_one_game_vs_reference` and the `--vs-reference` CLI dispatch**
 
 Mirror `play_one_game`'s loop structure exactly (same `terminal_value` check, same `GameRecord`/`PositionRecord` shapes), with two differences: the starting state is the function's `initial` parameter instead of `initial_state()`, and `candidate_player` is fixed to `initial.player` once before the loop starts. On each ply: if `state.player == candidate_player`, run MCTS exactly as `play_one_game` does (apply Dirichlet noise/temperature-sampling unless `deterministic` is set, per spec §3.2's call to apply it on *every* candidate ply in this mode, not just the first `TEMPERATURE_PLIES`); otherwise call `reference_turn(&state, reference_seconds)` (Task 3), convert its `CTurn` into a `PositionRecord { planes: encode_planes(&state), visits: vec![(action_index(...), 1)] }` using the same `action_index`/`worker_slot` computation `play_one_game` already does, and advance `state` to `turn.after`. Push a `PositionRecord` on *every* ply, candidate or reference, in play order — never filter the reference's plies out of `positions`. Wire the new CLI branch in `main()` the same way `--single-move`/`--encode-planes` are dispatched (checked before the continuous-mode argument parsing), reading the extra flags and looping over `--games` exactly like the continuous-mode tail already does (including the `INTERRUPTED` check between games).
 
-- [ ] **Step 6: Run the Rust test to verify it passes**
+- [x] **Step 6: Run the Rust test to verify it passes**
 
 Run: `cd native_engine && cargo test every_ply_is_recorded_and_the_candidate_keeps`
 Expected: PASS.
 
-- [ ] **Step 7: Rebuild the release binary**
+- [x] **Step 7: Rebuild the release binary**
 
 Run: `cd native_engine && cargo build --release`
 Expected: clean build.
 
-- [ ] **Step 8: Run the Python end-to-end test to verify it now passes**
+- [x] **Step 8: Run the Python end-to-end test to verify it now passes**
 
 Run: `python3 -m pytest tests/test_selfplay_end_to_end.py::test_vs_reference_mode_produces_games_with_every_ply_recorded -v`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add native_engine/src/bin/selfplay_worker.rs tests/test_selfplay_end_to_end.py
@@ -269,7 +269,7 @@ git commit -m "feat: add --vs-reference worker mode for the live anchor pilot"
 - Consumes: `tools.proven_anchor.anchor_games.play_reference_vs_reference` (Task 1's progress-enabled version), `santorini.native.encode`.
 - Produces: `prepare_anchor(out_dir: Path, opening_job: dict, back_plies: int, seconds: float, reference_binary, progress=...) -> Path` — the path to the written `anchor_state.bin`. Resumable: a second call with the same `out_dir` returns the existing file's path without replaying the seed game. Used by Task 8's `main()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_prepare_anchor_writes_the_position_back_plies_before_the_win(tmp_path, monkeypatch):
@@ -287,21 +287,21 @@ def test_prepare_anchor_raises_a_clear_error_when_the_seed_game_is_too_short(tmp
     # naming both numbers, not index out of range.
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `prepare_anchor`**
+- [x] **Step 3: Implement `prepare_anchor`**
 
 If `out_dir / "anchor_state.bin"` already exists, return it immediately (idempotent short-circuit, same spirit as `freeze_reference`). Otherwise call `play_reference_vs_reference(opening_job, seconds, reference_binary, progress=progress)`, compute `index = len(positions) - 1 - back_plies`, raise `ValueError(f"seed game only has {len(positions)} plies, need at least {back_plies + 1} to go back {back_plies} plies")` if `index < 0`, encode `positions[index]` via `santorini.native.encode`, write it atomically (temp file + `os.replace`, same convention as every other atomic write in this chantier) to `anchor_state.bin`, and also write a small `anchor_manifest.json` (opening job, `back_plies`, seed-game length, the anchor's own `player`) for later inspection.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -v`
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tools/anchor_pilot_campaign.py tests/test_anchor_pilot_campaign.py
@@ -317,7 +317,7 @@ git commit -m "feat: generate and freeze the live anchor pilot's starting positi
 **Interfaces:**
 - Produces: `freeze_worker_binary(out_dir: Path) -> tuple[Path, str]` — path to the frozen copy and its sha256. Used by Task 7/8.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_freeze_worker_binary_copies_and_records_sha256(tmp_path):
@@ -333,21 +333,21 @@ def test_freeze_worker_binary_rejects_a_changed_source_binary(tmp_path):
     # not silently keep serving the stale frozen copy.
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -k freeze_worker_binary -v`
 Expected: FAIL — `ModuleNotFoundError`/`AttributeError`.
 
-- [ ] **Step 3: Implement `freeze_worker_binary`**
+- [x] **Step 3: Implement `freeze_worker_binary`**
 
 Mirror `freeze_checkpoint`'s shape, but apply this plan's own Review Focus lesson directly: hash the *incoming* current binary (`native_engine/target/release/selfplay_worker`) every call, and compare it against the hash recorded in the manifest from the frozen copy — not merely the frozen copy's hash against itself. Raise a clear `ValueError` naming both hashes on mismatch (the exact Critical bug class this chantier already fixed once for `--checkpoint`).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -k freeze_worker_binary -v`
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tools/anchor_pilot_campaign.py tests/test_anchor_pilot_campaign.py
@@ -364,7 +364,7 @@ git commit -m "feat: freeze and pin the worker binary for the live anchor pilot"
 - Consumes: `santoni_az.inference_server.InferenceServer`, `santoni_az.trainer.Trainer` (both unchanged), `santoni_az.stats.clopper_pearson_lower_bound` (Task 2), the frozen worker binary + anchor state path (Tasks 5/6).
 - Produces: `AnchorPilotOrchestrator(run_dir, anchor_state_path, worker_binary_path, train_worker_count, eval_worker_count, simulations_per_move=32, reference_seconds=5.0)` with `start()`, `stop()`, `status()`. `status()` returns `{"generation", "last_loss", "games_available", "eval_games_available", "workers_alive", "eval_wins", "eval_n", "eval_ci_lower"}`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_start_runs_both_training_and_eval_workers(tmp_path):
@@ -388,21 +388,21 @@ def test_restart_does_not_lose_already_played_eval_games(tmp_path):
     # never decreases.
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_orchestrator.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement `AnchorPilotOrchestrator`**
+- [x] **Step 3: Implement `AnchorPilotOrchestrator`**
 
 `start()` calls `self.trainer.load_latest_checkpoint()` exactly as `Orchestrator.start()` does, before launching any worker — this single existing mechanism gives both spec requirements for free: a brand-new `run_dir` has no checkpoints, so the net stays at its fresh `net_factory()` initialization (spec §4); an interrupted-and-relaunched `run_dir` loads its own latest checkpoint (spec §3.4's resumability), with no special-casing needed to tell the two situations apart. Compose one `InferenceServer` (shared by both worker pools, same socket, same pattern as `Orchestrator`) and one `Trainer` pointed at `run_dir / "games"` (training games only — `eval_games` is never passed to `Trainer`, so evaluation data structurally cannot leak into training, satisfying spec §3.3's separation without needing a flag check anywhere). `start()` launches `train_worker_count` subprocesses of the frozen binary in `--vs-reference` mode (no `--deterministic`) writing into `games/`, and `eval_worker_count` subprocesses in `--vs-reference --deterministic` mode writing into `eval_games/`, both pointed at `anchor_state_path`; keeps the same background `_train_loop` thread as `Orchestrator` (verbatim reuse of its checkpointing logic — `MIN_CHECKPOINT_INTERVAL_S`-gated, train-then-maybe-save). `status()`'s `eval_ci_lower` reads the 40 most-recently-modified files under `eval_games/` (same `stat().st_mtime` sort `Trainer._rebuild_buffer_from_disk` already uses) and calls `clopper_pearson_lower_bound(wins, n)` on their `outcome` fields. No manifest lookup is needed to interpret `outcome`: Task 4's own fix round changed `GameRecord.outcome` for `--vs-reference` games to be candidate-relative directly — `play_one_game_vs_reference` reprojects the terminal value against `state.player == candidate_player` rather than `state.player == 0`, so `outcome == 1` uniformly means "the candidate won", regardless of which physical side (0 or 1) the anchor happened to give it. `_recent_eval_outcomes` reads each file's `outcome` field as-is.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_orchestrator.py -v`
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add santoni_az/anchor_pilot.py tests/test_anchor_pilot_orchestrator.py
@@ -418,7 +418,7 @@ git commit -m "feat: add AnchorPilotOrchestrator for the live anchor training+ev
 **Interfaces:**
 - Produces: `main()` (argparse: `--out`, `--corpus` default the existing no-power corpus, `--back-plies` default 5, `--train-workers`, `--eval-workers`, `--simulations-per-move` default 32, `--reference-seconds` default 5.0), the module's `if __name__ == '__main__': main()` entry point.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, monkeypatch):
@@ -428,26 +428,26 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
     # with the parsed CLI arguments, without needing a real multi-second run.
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -k main_wires -v`
 Expected: FAIL — `AttributeError: module has no attribute 'main'`.
 
-- [ ] **Step 3: Implement `main()`**
+- [x] **Step 3: Implement `main()`**
 
 Parse arguments, call `prepare_anchor`/`freeze_worker_binary` (Tasks 5/6), construct and `start()` the `AnchorPilotOrchestrator` (Task 7), install SIGTERM/SIGINT handlers that call `stop()` cleanly (same shape as every other launcher in this chantier, `selfplay-runs/run.py`/`run2.py`), then loop printing one status line every 10 seconds (generation, games_available, eval_n, eval_ci_lower, workers_alive) to stdout until interrupted — same convention as `run.log`'s existing status-line format, satisfying spec §3.4's visibility requirement directly.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m pytest tests/test_anchor_pilot_campaign.py -k main_wires -v`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full new test suite**
+- [x] **Step 5: Run the full new test suite**
 
 Run: `python3 -m pytest tests/test_stats.py tests/test_anchor_pilot_campaign.py tests/test_anchor_pilot_orchestrator.py tests/test_selfplay_end_to_end.py tests/test_proven_anchor_anchor_games.py -v`
 Expected: all PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tools/anchor_pilot_campaign.py tests/test_anchor_pilot_campaign.py
@@ -456,6 +456,6 @@ git commit -m "feat: add CLI entrypoint for the live anchor pilot campaign"
 
 ## Final smoke check (not a unit test — do this before handing back for the real launch decision)
 
-- [ ] Run the whole project's test suite once (`pytest` from the repo root) to confirm nothing outside this plan's own files regressed.
-- [ ] Run `python3 -m tools.anchor_pilot_campaign --out /tmp/anchor-pilot-smoke --train-workers 1 --eval-workers 1 --reference-seconds 0.3 --simulations-per-move 8` for ~30 seconds, confirm: anchor generation completes and logs progress, the worker binary gets frozen, status lines appear, both `games/` and `eval_games/` accumulate files, and `kill -TERM` on the process group stops it cleanly with no `.tmp` files left behind.
-- [ ] Report the smoke check's numbers back before suggesting the real campaign's worker counts/budgets.
+- [x] Run the whole project's test suite once (`pytest` from the repo root) to confirm nothing outside this plan's own files regressed.
+- [x] Run `python3 -m tools.anchor_pilot_campaign --out /tmp/anchor-pilot-smoke --train-workers 1 --eval-workers 1 --reference-seconds 0.3 --simulations-per-move 8` for ~30 seconds, confirm: anchor generation completes and logs progress, the worker binary gets frozen, status lines appear, both `games/` and `eval_games/` accumulate files, and `kill -TERM` on the process group stops it cleanly with no `.tmp` files left behind.
+- [x] Report the smoke check's numbers back before suggesting the real campaign's worker counts/budgets.
