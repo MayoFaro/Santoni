@@ -266,26 +266,51 @@ def main():
     print(f'orchestrator started, run_dir={args.out}, '
           f'train_workers={args.train_workers}, eval_workers={args.eval_workers}', flush=True)
 
-    while not stopping:
-        time.sleep(10)
-        status = orchestrator.status()
-        eval_ci_lower = status['eval_ci_lower']
-        # `eval_ci_lower` is `None` until at least one eval game has
-        # completed -- same "nothing real yet" convention as `last_loss`
-        # (see `AnchorPilotOrchestrator.status`'s own docstring). Formatting
-        # or comparing a `None` against the 0.95 success threshold here
-        # would crash this loop outright, so it prints 'n/a' instead.
-        eval_ci_str = 'n/a' if eval_ci_lower is None else f'{eval_ci_lower:.3f}'
-        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"generation={status['generation']} "
-              f"games_available={status['games_available']} "
-              f"eval_n={status['eval_n']} "
-              f"eval_ci_lower={eval_ci_str} "
-              f"workers_alive={status['workers_alive']}", flush=True)
-
-    print('stop requested, shutting down cleanly...', flush=True)
-    orchestrator.stop()
-    print('stopped', flush=True)
+    # `try/finally` from here on: `orchestrator.stop()` must run even if
+    # something inside the loop below raises (a future `status()` change,
+    # an `OSError` from a glob, ...) -- without this, an exception would
+    # unwind straight out of `main()` leaving both `Popen` worker pools
+    # (launched with `--games 100000`, so they never stop on their own)
+    # orphaned: still burning CPU, still writing into `games/` with nothing
+    # consuming them and a now-dead `infer.sock`. Review finding: on an
+    # unattended multi-day run with no other stop ceiling, that is exactly
+    # the silent-failure mode this whole plan exists to prevent.
+    try:
+        while not stopping:
+            time.sleep(10)
+            status = orchestrator.status()
+            eval_ci_lower = status['eval_ci_lower']
+            last_loss = status['last_loss']
+            eval_n = status['eval_n']
+            # `eval_ci_lower` and `last_loss` are both `None` until, resp.,
+            # the first eval game and the first real gradient step (see
+            # `AnchorPilotOrchestrator.status`'s own docstring). Formatting
+            # or comparing either `None` here would crash this loop
+            # outright, so both print 'n/a' instead.
+            eval_ci_str = 'n/a' if eval_ci_lower is None else f'{eval_ci_lower:.3f}'
+            loss_str = 'n/a' if last_loss is None else f'{last_loss:.4f}'
+            # Review finding: `eval_n` (the rolling `EVAL_WINDOW`-capped
+            # size `eval_win_rate` is computed over) and
+            # `eval_games_available` (the total eval games ever written to
+            # disk) are different numbers -- a 644-eval-game real smoke run
+            # only ever showed `eval_n=40` previously, with no way to tell
+            # "40 total" from "40 of many more". Printing both, plus the
+            # actual win rate (not just its conservative lower bound), is
+            # what spec Sec 3.4 ("parties d'évaluation jouées, taux de
+            # victoire courant + IC") actually asks for.
+            eval_win_rate_str = 'n/a' if eval_n == 0 else f"{status['eval_wins']}/{eval_n}"
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"generation={status['generation']} "
+                  f"loss={loss_str} "
+                  f"games_available={status['games_available']} "
+                  f"eval_games={status['eval_games_available']} "
+                  f"eval_win_rate={eval_win_rate_str} "
+                  f"eval_ci_lower={eval_ci_str} "
+                  f"workers_alive={status['workers_alive']}", flush=True)
+    finally:
+        print('stop requested, shutting down cleanly...', flush=True)
+        orchestrator.stop()
+        print('stopped', flush=True)
 
 
 if __name__ == '__main__':

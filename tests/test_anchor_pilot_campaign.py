@@ -195,14 +195,21 @@ def test_freeze_worker_binary_rejects_a_changed_source_binary(tmp_path, monkeypa
     assert new_sha256 in message
 
 
-def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, monkeypatch):
+def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, monkeypatch, capsys):
     """`main()`'s wiring, with no real multi-second run: `prepare_anchor`,
     `freeze_worker_binary` and `AnchorPilotOrchestrator` are all replaced
     with fakes that record call order/args, and the status-printing loop is
     made to exit on its very first iteration by capturing the real
     `signal.signal` handler registration and invoking the SIGTERM handler
     directly from the faked `time.sleep` -- deterministic, unlike relying
-    on a real `os.kill`-delivered signal's timing."""
+    on a real `os.kill`-delivered signal's timing.
+
+    The fake `status()` returns real (non-`None`) numbers for every field
+    -- including `eval_games_available` deliberately different from the
+    rolling-window-capped `eval_n` -- so the printed status line can be
+    checked for spec Sec 3.4's four required figures (training games
+    played, eval games played, current win rate + CI, generation/loss),
+    not just the fields `main()` happened to pick before review."""
     import tools.anchor_pilot_campaign as mod
 
     calls = []
@@ -243,9 +250,14 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
 
         def status(self):
             calls.append(('status',))
-            return {'generation': 0, 'last_loss': None, 'games_available': 0,
-                    'eval_games_available': 0, 'workers_alive': 2, 'eval_wins': 0,
-                    'eval_n': 0, 'eval_ci_lower': None}
+            # `eval_games_available` (total eval games ever played) is
+            # deliberately much larger than `eval_n` (the EVAL_WINDOW=40
+            # rolling-window size `eval_win_rate`/`eval_ci_lower` are
+            # computed over) -- same gap the real smoke run exposed (644
+            # eval games on disk, status line only ever showing 40).
+            return {'generation': 3, 'last_loss': 0.1234, 'games_available': 120,
+                    'eval_games_available': 644, 'workers_alive': 2, 'eval_wins': 7,
+                    'eval_n': 10, 'eval_ci_lower': 0.25}
 
     monkeypatch.setattr(mod, 'freeze_reference', fake_freeze_reference)
     monkeypatch.setattr(mod, 'freeze_worker_binary', fake_freeze_worker_binary)
@@ -307,3 +319,127 @@ def test_main_wires_prepare_anchor_freeze_and_orchestrator_together(tmp_path, mo
     assert construct_call[5] == 1
     assert construct_call[6] == 16
     assert construct_call[7] == 1.5
+
+    # Review finding: the status line was missing `last_loss`, the actual
+    # win rate, and `eval_games_available` (vs. the rolling-window-capped
+    # `eval_n`) -- spec Sec 3.4 asks for all four: training games played,
+    # eval games played, current win rate + CI, generation/loss.
+    out = capsys.readouterr().out
+    assert 'generation=3' in out
+    assert 'loss=0.1234' in out
+    assert 'games_available=120' in out
+    assert 'eval_games=644' in out
+    assert 'eval_win_rate=7/10' in out
+    assert 'eval_ci_lower=0.250' in out
+    assert 'workers_alive=2' in out
+
+
+def test_main_status_line_reports_n_a_before_any_loss_or_eval_game(tmp_path, monkeypatch, capsys):
+    """Same wiring as the test above, but with `status()` returning the
+    all-`None`/zero shape `AnchorPilotOrchestrator.status()` actually
+    returns in the first seconds of a real run (no gradient step yet, no
+    eval game finished yet) -- the status line must print 'n/a' for
+    `loss`, `eval_win_rate` and `eval_ci_lower` rather than crashing on a
+    `None` formatted as a float or compared against a threshold."""
+    import tools.anchor_pilot_campaign as mod
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    corpus_path = tmp_path / 'corpus.json'
+    corpus_path.write_text(json.dumps({'jobs': [opening_job], 'seed': 1}))
+
+    monkeypatch.setattr(mod, 'freeze_reference',
+                         lambda out_dir: (tmp_path / 'frozen_reference.so', {'engine_sha256': 'x'}))
+    monkeypatch.setattr(mod, 'freeze_worker_binary', lambda out_dir: (tmp_path / 'frozen_worker', 'y'))
+    monkeypatch.setattr(mod, 'prepare_anchor',
+                         lambda *a, **kw: tmp_path / 'anchor_state.bin')
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def status(self):
+            return {'generation': 0, 'last_loss': None, 'games_available': 0,
+                    'eval_games_available': 0, 'workers_alive': 2, 'eval_wins': 0,
+                    'eval_n': 0, 'eval_ci_lower': None}
+
+    monkeypatch.setattr(mod, 'AnchorPilotOrchestrator', FakeOrchestrator)
+
+    handlers = {}
+    monkeypatch.setattr(mod.signal, 'signal', lambda sig, handler: handlers.setdefault(sig, handler))
+
+    def fake_sleep(seconds):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    monkeypatch.setattr(mod.time, 'sleep', fake_sleep)
+
+    argv = ['anchor_pilot_campaign', '--out', str(tmp_path / 'out'), '--corpus', str(corpus_path),
+            '--train-workers', '1', '--eval-workers', '1']
+    monkeypatch.setattr('sys.argv', argv)
+
+    mod.main()
+
+    out = capsys.readouterr().out
+    assert 'loss=n/a' in out
+    assert 'eval_win_rate=n/a' in out
+    assert 'eval_ci_lower=n/a' in out
+
+
+def test_main_calls_stop_even_when_the_supervise_loop_raises(tmp_path, monkeypatch):
+    """Review finding: without a `try/finally` around the supervise loop,
+    an exception between `orchestrator.start()` and the loop's end (a
+    future `status()` change, an `OSError` from a glob, ...) would unwind
+    out of `main()` without ever calling `.stop()` -- orphaning both
+    `Popen` worker pools (launched with `--games 100000`, so they never
+    stop on their own) burning CPU indefinitely against a now-dead
+    `infer.sock`. `status()` raising on its very first call must still
+    reach `.stop()`, and the original exception must still propagate
+    (the `finally` block is cleanup, not a catch)."""
+    import tools.anchor_pilot_campaign as mod
+
+    calls = []
+
+    opening_job = {'workers': [[0, 1], [20, 21]], 'powers': [0, 0], 'first': 0}
+    corpus_path = tmp_path / 'corpus.json'
+    corpus_path.write_text(json.dumps({'jobs': [opening_job], 'seed': 1}))
+
+    monkeypatch.setattr(mod, 'freeze_reference',
+                         lambda out_dir: (tmp_path / 'frozen_reference.so', {'engine_sha256': 'x'}))
+    monkeypatch.setattr(mod, 'freeze_worker_binary', lambda out_dir: (tmp_path / 'frozen_worker', 'y'))
+    monkeypatch.setattr(mod, 'prepare_anchor',
+                         lambda *a, **kw: tmp_path / 'anchor_state.bin')
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            calls.append('start')
+
+        def stop(self):
+            calls.append('stop')
+
+        def status(self):
+            raise OSError('simulated glob failure mid-loop')
+
+    monkeypatch.setattr(mod, 'AnchorPilotOrchestrator', FakeOrchestrator)
+
+    # The signal handler is never fired in this test: the loop never gets
+    # a chance to observe `stopping` -- `status()` raises on its first
+    # call, before the `while` condition is even re-checked.
+    monkeypatch.setattr(mod.signal, 'signal', lambda sig, handler: None)
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+
+    argv = ['anchor_pilot_campaign', '--out', str(tmp_path / 'out'), '--corpus', str(corpus_path),
+            '--train-workers', '1', '--eval-workers', '1']
+    monkeypatch.setattr('sys.argv', argv)
+
+    with pytest.raises(OSError, match='simulated glob failure'):
+        mod.main()
+
+    assert calls == ['start', 'stop']
