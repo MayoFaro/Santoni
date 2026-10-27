@@ -99,3 +99,45 @@ def test_evaluate_net_sign_match_rate_on_mixed_signs():
     examples = _toy_examples(4, value=1.0) + _toy_examples(4, value=-1.0)
     metrics = evaluate_net(net, examples)
     assert 0.0 <= metrics["value_sign_match_rate"] <= 1.0
+
+
+def test_parse_architectures_parses_channel_block_pairs():
+    from tools.network_capacity_ablation import parse_architectures
+    assert parse_architectures(["32:4", "64:8"]) == [(32, 4), (64, 8)]
+
+
+def test_parse_architectures_rejects_malformed_entry():
+    from tools.network_capacity_ablation import parse_architectures
+    import pytest
+    with pytest.raises(ValueError, match="32:4"):
+        parse_architectures(["abc"])
+
+
+def test_main_writes_atomic_report_and_no_leftover_tmp(tmp_path, capsys):
+    from tools.network_capacity_ablation import main
+    games_dir = tmp_path / "games"
+    games_dir.mkdir()
+    for i in range(6):
+        write_fake_game(games_dir, f"game-{i:04d}.json", 1 if i % 2 == 0 else -1, [
+            (PLACEHOLDER_PLANES, [[10, 1]]),
+            (PLACEHOLDER_PLANES, [[11, 1]]),
+        ])
+    out_path = tmp_path / "report.json"
+    main([
+        "--games-dir", str(games_dir),
+        "--architectures", "8:1", "16:2",
+        "--max-train-positions", "8",
+        "--max-holdout-positions", "4",
+        "--holdout-fraction", "0.34",
+        "--steps", "3",
+        "--batch-size", "2",
+        "--out", str(out_path),
+    ])
+    assert out_path.exists()
+    assert not out_path.with_suffix(".json.tmp").exists()
+    report = json.loads(out_path.read_text())
+    assert [entry["channels"] for entry in report["architectures"]] == [8, 16]
+    for entry in report["architectures"]:
+        assert "total_loss" in entry and "value_sign_match_rate" in entry
+    captured = capsys.readouterr()
+    assert "16" in captured.out  # tableau récapitulatif affiché

@@ -6,7 +6,9 @@ plafonne la qualité apprise. Voir
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -132,3 +134,77 @@ def evaluate_net(net, held_out_examples):
         "total_loss": float(policy_loss.item()) + float(value_loss.item()),
         "value_sign_match_rate": sign_match_rate,
     }
+
+
+def parse_architectures(raw):
+    """Décode une liste de `"channels:blocks"` (ex. `"32:4"`) en paires
+    d'entiers. Message d'erreur explicite plutôt qu'une trace Python
+    brute sur une entrée mal formée en CLI."""
+    architectures = []
+    for entry in raw:
+        parts = entry.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                f"architecture invalide {entry!r}, format attendu 'channels:blocks' (ex. '32:4')"
+            )
+        try:
+            channels, blocks = int(parts[0]), int(parts[1])
+        except ValueError:
+            raise ValueError(
+                f"architecture invalide {entry!r}, format attendu 'channels:blocks' (ex. '32:4')"
+            )
+        architectures.append((channels, blocks))
+    return architectures
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--games-dir", default="selfplay-runs/anchor-pilot-20261021/games")
+    parser.add_argument("--architectures", nargs="+", default=["32:4", "64:8", "128:12"])
+    parser.add_argument("--max-train-positions", type=int, default=200_000)
+    parser.add_argument("--max-holdout-positions", type=int, default=20_000)
+    parser.add_argument("--holdout-fraction", type=float, default=0.1)
+    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=20261027)
+    parser.add_argument("--out", default="selfplay-runs/ablation-20261027/report.json")
+    args = parser.parse_args(argv)
+
+    architectures = parse_architectures(args.architectures)
+
+    game_files = list_game_files(args.games_dir)
+    train_files, holdout_files = split_train_holdout(game_files, args.holdout_fraction, args.seed)
+    train_examples = load_examples(args.games_dir, train_files, args.max_train_positions, args.seed)
+    holdout_examples = load_examples(args.games_dir, holdout_files, args.max_holdout_positions, args.seed)
+
+    results = []
+    print(f"{'channels':>8} {'blocks':>6} {'params':>10} {'total_loss':>12} {'sign_match':>10}")
+    for channels, blocks in architectures:
+        net = build_net(channels, blocks)
+        losses = train_net(net, train_examples, args.steps, args.batch_size, args.seed)
+        metrics = evaluate_net(net, holdout_examples)
+        num_parameters = sum(p.numel() for p in net.parameters())
+        results.append({
+            "channels": channels,
+            "blocks": blocks,
+            "num_parameters": num_parameters,
+            "train_losses": losses,
+            **metrics,
+        })
+        print(f"{channels:>8} {blocks:>6} {num_parameters:>10} "
+              f"{metrics['total_loss']:>12.4f} {metrics['value_sign_match_rate']:>10.3f}")
+
+    report = {
+        "games_dir": str(args.games_dir),
+        "seed": args.seed,
+        "architectures": results,
+    }
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(report, indent=2))
+    os.replace(tmp_path, out_path)
+
+
+if __name__ == "__main__":
+    main()
