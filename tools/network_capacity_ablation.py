@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -16,6 +17,11 @@ import torch
 import torch.nn.functional as F
 
 from santoni_az.network import PolicyValueNet
+# Accès à une méthode privée de `Trainer`, délibérément sanctionné par le
+# spec (2026-10-27-mcts-az-network-capacity-ablation-design.md) : la
+# convention de signe par ply y est fixée une seule fois plutôt que
+# dupliquée ici, pour éviter la classe de bug (signe/perspective) qui a
+# déjà touché ce chantier deux fois.
 from santoni_az.trainer import Trainer
 
 
@@ -49,8 +55,10 @@ def load_examples(games_dir, game_files, max_positions, seed):
     l'échantillon vers les fichiers en tête de `game_files`. S'arrête dès
     le cap atteint, sans lire de fichier supplémentaire. Un fichier
     illisible/corrompu (même risque que `Trainer.consume_new_games` —
-    écriture non-fsync avant renommage atomique) est ignoré silencieusement."""
-    games_dir = Path(games_dir)
+    écriture non-fsync avant renommage atomique) est ignoré silencieusement.
+    `games_dir` n'est plus utilisé pour recomposer les chemins (chaque
+    élément de `game_files` est déjà complet) — conservé uniquement pour
+    la stabilité de la signature avec Task 1."""
     order = list(game_files)
     random.Random(seed).shuffle(order)
     examples = []
@@ -58,7 +66,12 @@ def load_examples(games_dir, game_files, max_positions, seed):
         if len(examples) >= max_positions:
             break
         try:
-            data = json.loads((games_dir / f.name).read_text())
+            # `f` est déjà un chemin complet quand il vient de
+            # `list_game_files`/`split_train_holdout` (le seul producteur
+            # réel dans ce script) — le lire directement plutôt que de le
+            # recomposer avec `games_dir` évite de silencieusement relire
+            # un autre répertoire si `game_files` venait d'ailleurs.
+            data = json.loads(Path(f).read_text())
         except (json.JSONDecodeError, OSError):
             continue
         outcome = data["outcome"]
@@ -95,7 +108,10 @@ def train_net(net, examples, steps, batch_size, seed):
     `Trainer.train_step`, qui se contente de réduire la taille de batch
     via `min(batch_size, len(self._examples))` : cette ablation veut un
     nombre de pas de gradient constant même sur un petit jeu de test, pas
-    un batch rétréci)."""
+    un batch rétréci). Remet `net` en mode entraînement (`net.train()`) —
+    nécessaire depuis que `main` évalue un réseau neuf (mode `.eval()`,
+    `evaluate_net`) comme référence avant d'appeler `train_net` dessus."""
+    net.train()
     rng = random.Random(seed)
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
     losses = []
@@ -138,49 +154,129 @@ def evaluate_net(net, held_out_examples):
 
 def parse_architectures(raw):
     """Décode une liste de `"channels:blocks"` (ex. `"32:4"`) en paires
-    d'entiers. Message d'erreur explicite plutôt qu'une trace Python
-    brute sur une entrée mal formée en CLI."""
+    d'entiers positifs (`channels >= 1`, `blocks >= 0`). Message d'erreur
+    explicite plutôt qu'une trace Python brute sur une entrée mal formée
+    en CLI."""
     architectures = []
     for entry in raw:
         parts = entry.split(":")
+        invalid = ValueError(
+            f"architecture invalide {entry!r}, format attendu 'channels:blocks' (ex. '32:4')"
+        )
         if len(parts) != 2:
-            raise ValueError(
-                f"architecture invalide {entry!r}, format attendu 'channels:blocks' (ex. '32:4')"
-            )
+            raise invalid
         try:
             channels, blocks = int(parts[0]), int(parts[1])
         except ValueError:
-            raise ValueError(
-                f"architecture invalide {entry!r}, format attendu 'channels:blocks' (ex. '32:4')"
-            )
+            raise invalid from None
+        if channels < 1 or blocks < 0:
+            raise invalid
         architectures.append((channels, blocks))
     return architectures
 
 
+def _value_balance(examples):
+    """Répartition des signes de `value_target` dans `examples` — permet
+    de repérer depuis le rapport un pool dont l'issue est très déséquilibrée
+    (ex. un côté qui perd ~99% des parties), régime où
+    `value_sign_match_rate` peut saturer sans rapport avec une vraie
+    qualité de valeur apprise (cf. focus de revue)."""
+    positive = sum(1 for _, _, v in examples if v > 0)
+    negative = sum(1 for _, _, v in examples if v < 0)
+    zero = len(examples) - positive - negative
+    return {"positive": positive, "negative": negative, "zero": zero}
+
+
+def _sanitize_for_json(value):
+    """Remplace tout float non fini (`NaN`/`inf`, atteignable si une
+    architecture diverge) par `None` avant sérialisation — `json.dumps`
+    par défaut écrirait un littéral `NaN`/`Infinity` invalide pour tout
+    lecteur JSON non-Python, sans faire échouer l'écriture atomique elle-même."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    return value
+
+
+def build_arg_parser():
+    """Construit le parser CLI séparément de `main` pour pouvoir inspecter
+    ses valeurs par défaut (ex. tests) sans lancer d'entraînement."""
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--games-dir", default="selfplay-runs/anchor-pilot-20261021/games",
+                         help="répertoire contenant les game-*.json à ré-entraîner hors ligne")
+    parser.add_argument("--architectures", nargs="+", default=["32:4", "64:8", "128:12"],
+                         help="liste de 'channels:blocks', ex. 32:4 64:8 128:12")
+    parser.add_argument("--max-train-positions", type=int, default=200_000,
+                         help="plafond de positions chargées pour le pool d'entraînement")
+    parser.add_argument("--max-holdout-positions", type=int, default=20_000,
+                         help="plafond de positions chargées pour le pool held-out")
+    parser.add_argument("--holdout-fraction", type=float, default=0.1,
+                         help="fraction des parties (pas des positions) réservée au held-out")
+    parser.add_argument("--steps", type=int, default=10_000,
+                         help="pas de gradient par architecture (>=10000 recommandé : "
+                              "2000 ne couvre qu'une fraction d'epoch sur un pool de 200k "
+                              "positions et avantage artificiellement les petits réseaux)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                         help="taille de batch, alignée sur Trainer.train_step")
+    parser.add_argument("--seed", type=int, default=20261027,
+                         help="graine unique pour la partition, l'échantillonnage et "
+                              "l'initialisation des poids (réappliquée avant chaque "
+                              "architecture pour une reproductibilité par architecture)")
+    parser.add_argument("--out", default="selfplay-runs/ablation-20261027/report.json",
+                         help="chemin du rapport JSON (écriture atomique)")
+    return parser
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--games-dir", default="selfplay-runs/anchor-pilot-20261021/games")
-    parser.add_argument("--architectures", nargs="+", default=["32:4", "64:8", "128:12"])
-    parser.add_argument("--max-train-positions", type=int, default=200_000)
-    parser.add_argument("--max-holdout-positions", type=int, default=20_000)
-    parser.add_argument("--holdout-fraction", type=float, default=0.1)
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--seed", type=int, default=20261027)
-    parser.add_argument("--out", default="selfplay-runs/ablation-20261027/report.json")
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    architectures = parse_architectures(args.architectures)
+    try:
+        architectures = parse_architectures(args.architectures)
+        game_files = list_game_files(args.games_dir)
+        if not game_files:
+            raise ValueError(f"aucun fichier game-*.json trouvé dans {args.games_dir!r}")
+        train_files, holdout_files = split_train_holdout(game_files, args.holdout_fraction, args.seed)
+        if not train_files:
+            raise ValueError(
+                f"pool d'entraînement vide (holdout_fraction={args.holdout_fraction} "
+                f"sur {len(game_files)} fichiers → 0 pour l'entraînement)"
+            )
+        if not holdout_files:
+            raise ValueError(
+                f"pool held-out vide (holdout_fraction={args.holdout_fraction} "
+                f"sur {len(game_files)} fichiers → 0)"
+            )
+        train_examples = load_examples(args.games_dir, train_files, args.max_train_positions, args.seed)
+        holdout_examples = load_examples(args.games_dir, holdout_files, args.max_holdout_positions, args.seed)
+        if not train_examples:
+            raise ValueError("aucune position chargée dans le pool d'entraînement")
+        if not holdout_examples:
+            raise ValueError("aucune position chargée dans le pool held-out")
+    except ValueError as exc:
+        parser.error(str(exc))
+        return  # parser.error() appelle sys.exit ; inatteignable, garde le flux explicite
 
-    game_files = list_game_files(args.games_dir)
-    train_files, holdout_files = split_train_holdout(game_files, args.holdout_fraction, args.seed)
-    train_examples = load_examples(args.games_dir, train_files, args.max_train_positions, args.seed)
-    holdout_examples = load_examples(args.games_dir, holdout_files, args.max_holdout_positions, args.seed)
+    epochs_equivalent = args.steps * args.batch_size / len(train_examples)
 
     results = []
-    print(f"{'channels':>8} {'blocks':>6} {'params':>10} {'total_loss':>12} {'sign_match':>10}")
+    print(f"{'channels':>8} {'blocks':>6} {'params':>10} {'baseline_vsm':>12} "
+          f"{'policy_loss':>12} {'value_loss':>11} {'value_sign_match':>16}", flush=True)
     for channels, blocks in architectures:
+        # Réinitialise la graine torch à la même valeur avant chaque
+        # architecture : sans cela, l'initialisation des poids de
+        # l'architecture n dépend du nombre de tirages aléatoires déjà
+        # consommés par les architectures précédentes (confond la
+        # comparaison avec la chance d'initialisation) et deux lancements
+        # du même `--seed` ne donnent pas le même résultat.
+        torch.manual_seed(args.seed)
         net = build_net(channels, blocks)
+        baseline_metrics = evaluate_net(net, holdout_examples)
         losses = train_net(net, train_examples, args.steps, args.batch_size, args.seed)
         metrics = evaluate_net(net, holdout_examples)
         num_parameters = sum(p.numel() for p in net.parameters())
@@ -189,20 +285,38 @@ def main(argv=None):
             "blocks": blocks,
             "num_parameters": num_parameters,
             "train_losses": losses,
+            "baseline_policy_loss": baseline_metrics["policy_loss"],
+            "baseline_value_loss": baseline_metrics["value_loss"],
+            "baseline_total_loss": baseline_metrics["total_loss"],
+            "baseline_value_sign_match_rate": baseline_metrics["value_sign_match_rate"],
             **metrics,
         })
         print(f"{channels:>8} {blocks:>6} {num_parameters:>10} "
-              f"{metrics['total_loss']:>12.4f} {metrics['value_sign_match_rate']:>10.3f}")
+              f"{baseline_metrics['value_sign_match_rate']:>12.3f} "
+              f"{metrics['policy_loss']:>12.4f} {metrics['value_loss']:>11.4f} "
+              f"{metrics['value_sign_match_rate']:>16.3f}", flush=True)
 
     report = {
         "games_dir": str(args.games_dir),
         "seed": args.seed,
+        "steps": args.steps,
+        "batch_size": args.batch_size,
+        "max_train_positions": args.max_train_positions,
+        "max_holdout_positions": args.max_holdout_positions,
+        "holdout_fraction": args.holdout_fraction,
+        "train_file_count": len(train_files),
+        "holdout_file_count": len(holdout_files),
+        "train_pool_size": len(train_examples),
+        "holdout_pool_size": len(holdout_examples),
+        "train_value_balance": _value_balance(train_examples),
+        "holdout_value_balance": _value_balance(holdout_examples),
+        "epochs_equivalent": epochs_equivalent,
         "architectures": results,
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(report, indent=2))
+    tmp_path.write_text(json.dumps(_sanitize_for_json(report), indent=2))
     os.replace(tmp_path, out_path)
 
 

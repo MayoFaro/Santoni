@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import torch
+
 from tools.network_capacity_ablation import list_game_files, split_train_holdout, load_examples
 
 PLACEHOLDER_PLANES = [0] * (6 * 5 * 5)  # NUM_PLANES * 5 * 5
@@ -98,7 +100,55 @@ def test_evaluate_net_sign_match_rate_on_mixed_signs():
     net = build_net(channels=8, blocks=1)
     examples = _toy_examples(4, value=1.0) + _toy_examples(4, value=-1.0)
     metrics = evaluate_net(net, examples)
-    assert 0.0 <= metrics["value_sign_match_rate"] <= 1.0
+    # Toutes les planes sont à zéro -> le réseau émet la même valeur pour
+    # les 8 exemples, donc la concordance de signe vaut exactement 0.5 (4
+    # cibles +1 sur 8). `0.0 <= x <= 1.0` était vrai de n'importe quelle
+    # moyenne de booléens et n'aurait pas détecté une régression de
+    # broadcasting (value_pred (N,1) vs value_targets (N,) -> (N,N)).
+    assert metrics["value_sign_match_rate"] == 0.5
+
+
+def test_load_examples_is_deterministic_across_calls(tmp_path):
+    from tools.network_capacity_ablation import list_game_files, load_examples
+    for i in range(5):
+        write_fake_game(tmp_path, f"game-{i:04d}.json", 1 if i % 2 == 0 else -1, [
+            (PLACEHOLDER_PLANES, [[i, 1]]),
+            (PLACEHOLDER_PLANES, [[i + 1, 1]]),
+        ])
+    files = list_game_files(tmp_path)
+    first = load_examples(tmp_path, files, max_positions=100, seed=7)
+    second = load_examples(tmp_path, files, max_positions=100, seed=7)
+    assert len(first) == len(second)
+    for (p1, pt1, v1), (p2, pt2, v2) in zip(first, second):
+        assert torch.equal(p1, p2)
+        assert torch.equal(pt1, pt2)
+        assert v1 == v2
+
+
+def test_load_examples_train_and_holdout_never_overlap_end_to_end(tmp_path):
+    """Chaque partie reçoit un marqueur unique dans ses planes (action_idx
+    des visites) -- si `load_examples` lisait jamais le mauvais pool, un
+    marqueur apparaîtrait dans les deux listes d'exemples décodés."""
+    from tools.network_capacity_ablation import (
+        list_game_files, split_train_holdout, load_examples,
+    )
+    for i in range(30):
+        write_fake_game(tmp_path, f"game-{i:04d}.json", 1, [
+            (PLACEHOLDER_PLANES, [[1000 + i, 1]]),
+        ])
+    files = list_game_files(tmp_path)
+    train_files, holdout_files = split_train_holdout(files, holdout_fraction=0.3, seed=3)
+    train_examples = load_examples(tmp_path, train_files, max_positions=1000, seed=3)
+    holdout_examples = load_examples(tmp_path, holdout_files, max_positions=1000, seed=3)
+
+    def markers(examples):
+        return {int(policy_target.nonzero().item()) for _, policy_target, _ in examples}
+
+    train_markers = markers(train_examples)
+    holdout_markers = markers(holdout_examples)
+    assert train_markers  # non vide, sinon le test ne prouve rien
+    assert holdout_markers
+    assert train_markers.isdisjoint(holdout_markers)
 
 
 def test_parse_architectures_parses_channel_block_pairs():
@@ -141,3 +191,118 @@ def test_main_writes_atomic_report_and_no_leftover_tmp(tmp_path, capsys):
         assert "total_loss" in entry and "value_sign_match_rate" in entry
     captured = capsys.readouterr()
     assert "16" in captured.out  # tableau récapitulatif affiché
+
+
+def _write_balanced_fixture_games(games_dir, n=8):
+    for i in range(n):
+        write_fake_game(games_dir, f"game-{i:04d}.json", 1 if i % 2 == 0 else -1, [
+            (PLACEHOLDER_PLANES, [[10, 1]]),
+            (PLACEHOLDER_PLANES, [[11, 1]]),
+            (PLACEHOLDER_PLANES, [[12, 1]]),
+        ])
+
+
+def _run_tiny_main(tmp_path, out_name="report.json", extra_args=None, seed="5"):
+    from tools.network_capacity_ablation import main
+    games_dir = tmp_path / "games"
+    if not games_dir.exists():
+        games_dir.mkdir()
+        _write_balanced_fixture_games(games_dir)
+    out_path = tmp_path / out_name
+    args = [
+        "--games-dir", str(games_dir),
+        "--architectures", "8:1", "16:2",
+        "--max-train-positions", "12",
+        "--max-holdout-positions", "6",
+        "--holdout-fraction", "0.3",
+        "--steps", "4",
+        "--batch-size", "2",
+        "--seed", seed,
+        "--out", str(out_path),
+    ]
+    main(args + (extra_args or []))
+    return json.loads(out_path.read_text())
+
+
+def test_main_rejects_malformed_architecture_without_traceback(tmp_path, capsys):
+    import pytest
+    from tools.network_capacity_ablation import main
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--games-dir", str(tmp_path), "--architectures", "abc"])
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "32:4" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_raises_clear_error_on_missing_games_dir(tmp_path, capsys):
+    import pytest
+    from tools.network_capacity_ablation import main
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--games-dir", str(missing)])
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert str(missing) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_raises_clear_error_on_empty_holdout_pool(tmp_path, capsys):
+    import pytest
+    from tools.network_capacity_ablation import main
+    games_dir = tmp_path / "games"
+    games_dir.mkdir()
+    _write_balanced_fixture_games(games_dir, n=4)
+    with pytest.raises(SystemExit) as exc_info:
+        # round(4 * 0.1) == 0 -> pool held-out vide
+        main(["--games-dir", str(games_dir), "--holdout-fraction", "0.1"])
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "held-out" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_default_steps_is_at_least_10000():
+    from tools.network_capacity_ablation import build_arg_parser
+    parser = build_arg_parser()
+    assert parser.get_default("steps") >= 10_000
+
+
+def test_main_report_includes_training_regime_and_pool_sizes(tmp_path):
+    report = _run_tiny_main(tmp_path, out_name="report2.json", seed="6")
+    for key in ("steps", "batch_size", "max_train_positions", "max_holdout_positions",
+                "holdout_fraction", "train_file_count", "holdout_file_count",
+                "train_pool_size", "holdout_pool_size", "epochs_equivalent",
+                "train_value_balance", "holdout_value_balance"):
+        assert key in report, f"clé manquante dans le rapport : {key}"
+    assert report["steps"] == 4
+    assert report["train_pool_size"] > 0
+    assert report["holdout_pool_size"] > 0
+
+
+def test_main_help_documents_defaults(capsys):
+    import pytest
+    from tools.network_capacity_ablation import main
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    captured = capsys.readouterr()
+    assert "--steps" in captured.out
+    assert "channels:blocks" in captured.out  # une aide concrète, pas juste le nom du flag
+
+
+def test_main_same_seed_two_runs_produce_identical_reports(tmp_path):
+    first = _run_tiny_main(tmp_path, out_name="report-a.json", seed="9")
+    second = _run_tiny_main(tmp_path, out_name="report-b.json", seed="9")
+    assert first["architectures"] == second["architectures"]
+
+
+def test_main_report_includes_baseline_metrics_before_training(tmp_path):
+    report = _run_tiny_main(tmp_path, out_name="report-baseline.json", seed="11")
+    for entry in report["architectures"]:
+        for key in ("baseline_policy_loss", "baseline_value_loss",
+                    "baseline_total_loss", "baseline_value_sign_match_rate"):
+            assert key in entry, f"clé baseline manquante : {key}"
+        # La perte baseline (réseau non entraîné) ne doit pas être
+        # identique par construction à la perte après entraînement --
+        # sinon rien ne distingue "avant" de "après" dans le rapport.
+        assert entry["baseline_total_loss"] != entry["total_loss"]
