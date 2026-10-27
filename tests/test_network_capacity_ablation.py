@@ -60,3 +60,42 @@ def test_load_examples_skips_corrupt_file(tmp_path):
     files = list_game_files(tmp_path)
     examples = load_examples(tmp_path, files, max_positions=10, seed=1)
     assert len(examples) == 1
+
+
+def _toy_examples(n, value):
+    import torch
+    from santoni_az.network import NUM_PLANES, ACTION_SPACE
+    examples = []
+    for _ in range(n):
+        planes = torch.zeros(NUM_PLANES, 5, 5)
+        policy = torch.zeros(ACTION_SPACE)
+        policy[0] = 1.0
+        examples.append((planes, policy, value))
+    return examples
+
+
+def test_train_net_returns_one_loss_per_step():
+    from tools.network_capacity_ablation import build_net, train_net
+    net = build_net(channels=8, blocks=1)
+    examples = _toy_examples(16, value=1.0)
+    losses = train_net(net, examples, steps=5, batch_size=4, seed=1)
+    assert len(losses) == 5
+    assert all(isinstance(loss, float) for loss in losses)
+
+
+def test_evaluate_net_reports_full_sign_match_on_trivial_data():
+    from tools.network_capacity_ablation import build_net, train_net, evaluate_net
+    net = build_net(channels=8, blocks=1)
+    examples = _toy_examples(32, value=1.0)
+    train_net(net, examples, steps=200, batch_size=8, seed=1)
+    metrics = evaluate_net(net, examples)
+    assert set(metrics) == {"policy_loss", "value_loss", "total_loss", "value_sign_match_rate"}
+    assert metrics["value_sign_match_rate"] == 1.0  # toutes les cibles sont positives
+
+
+def test_evaluate_net_sign_match_rate_on_mixed_signs():
+    from tools.network_capacity_ablation import build_net, evaluate_net
+    net = build_net(channels=8, blocks=1)
+    examples = _toy_examples(4, value=1.0) + _toy_examples(4, value=-1.0)
+    metrics = evaluate_net(net, examples)
+    assert 0.0 <= metrics["value_sign_match_rate"] <= 1.0

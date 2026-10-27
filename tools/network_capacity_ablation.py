@@ -10,6 +10,10 @@ import json
 import random
 from pathlib import Path
 
+import torch
+import torch.nn.functional as F
+
+from santoni_az.network import PolicyValueNet
 from santoni_az.trainer import Trainer
 
 
@@ -59,3 +63,72 @@ def load_examples(games_dir, game_files, max_positions, seed):
         for ply, position in enumerate(data["positions"]):
             examples.append(Trainer._decode_position(position, ply, outcome))
     return examples[:max_positions]
+
+
+def build_net(channels, blocks):
+    """Enveloppe nommée pour la lisibilité du reste du script — aucune
+    logique propre."""
+    return PolicyValueNet(channels=channels, blocks=blocks)
+
+
+def _stack_batch(batch):
+    planes = torch.stack([p for p, _, _ in batch])
+    policy_targets = torch.stack([pt for _, pt, _ in batch])
+    value_targets = torch.tensor([vt for _, _, vt in batch], dtype=torch.float32).unsqueeze(1)
+    return planes, policy_targets, value_targets
+
+
+def _loss_components(net, planes, policy_targets, value_targets):
+    policy_logits, value_pred = net(planes)
+    policy_loss = F.cross_entropy(policy_logits, policy_targets)
+    value_loss = F.mse_loss(value_pred, value_targets)
+    return policy_loss, value_loss, value_pred
+
+
+def train_net(net, examples, steps, batch_size, seed):
+    """Boucle d'entraînement supervisé pur sur `examples` fixe (pas de
+    self-play, pas de tampon glissant) — même composition de perte que
+    `Trainer.train_step`. Échantillonnage sans remise quand `batch_size`
+    tient dans la population, avec remise au-delà (contrairement à
+    `Trainer.train_step`, qui se contente de réduire la taille de batch
+    via `min(batch_size, len(self._examples))` : cette ablation veut un
+    nombre de pas de gradient constant même sur un petit jeu de test, pas
+    un batch rétréci)."""
+    rng = random.Random(seed)
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    losses = []
+    for _ in range(steps):
+        if batch_size <= len(examples):
+            batch = rng.sample(examples, batch_size)
+        else:
+            batch = rng.choices(examples, k=batch_size)
+        planes, policy_targets, value_targets = _stack_batch(batch)
+        policy_loss, value_loss, _ = _loss_components(net, planes, policy_targets, value_targets)
+        loss = policy_loss + value_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.item()))
+    return losses
+
+
+def evaluate_net(net, held_out_examples):
+    """Pertes moyennes + concordance de signe (valeur) sur `held_out_examples`,
+    réseau en mode évaluation. Une cible ou prédiction à `0.0` est traitée
+    comme son propre signe (via `torch.sign`, qui renvoie 0 pour 0) — sans
+    conséquence pratique ici puisque `Trainer._decode_position` ne produit
+    que des `value_target` à ±1 (issue terminale). Ne restaure pas
+    `net.train()` avant de retourner : limite de portée délibérée, chaque
+    architecture reçoit un réseau neuf et n'est jamais réentraînée après
+    son propre appel à `evaluate_net`."""
+    net.eval()
+    with torch.no_grad():
+        planes, policy_targets, value_targets = _stack_batch(held_out_examples)
+        policy_loss, value_loss, value_pred = _loss_components(net, planes, policy_targets, value_targets)
+        sign_match_rate = (value_pred.sign() == value_targets.sign()).float().mean().item()
+    return {
+        "policy_loss": float(policy_loss.item()),
+        "value_loss": float(value_loss.item()),
+        "total_loss": float(policy_loss.item()) + float(value_loss.item()),
+        "value_sign_match_rate": sign_match_rate,
+    }
