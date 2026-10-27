@@ -296,6 +296,49 @@ def test_main_same_seed_two_runs_produce_identical_reports(tmp_path):
     assert first["architectures"] == second["architectures"]
 
 
+def test_main_writes_partial_report_after_each_architecture(tmp_path, monkeypatch):
+    """Si le processus est interrompu pendant l'entraînement d'une
+    architecture (ex. SIGTERM par l'utilisateur), le rapport doit déjà
+    contenir les architectures précédentes, déjà terminées, plutôt que de
+    tout perdre parce que l'écriture n'avait lieu qu'une fois à la toute
+    fin de la boucle."""
+    import pytest
+    import tools.network_capacity_ablation as module
+
+    games_dir = tmp_path / "games"
+    games_dir.mkdir()
+    _write_balanced_fixture_games(games_dir, n=8)
+    out_path = tmp_path / "report.json"
+
+    original_train_net = module.train_net
+    calls = {"count": 0}
+
+    def flaky_train_net(net, examples, steps, batch_size, seed):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("simulated interruption before the second architecture finishes")
+        return original_train_net(net, examples, steps, batch_size, seed)
+
+    monkeypatch.setattr(module, "train_net", flaky_train_net)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        module.main([
+            "--games-dir", str(games_dir),
+            "--architectures", "8:1", "16:2",
+            "--max-train-positions", "8",
+            "--max-holdout-positions", "4",
+            "--holdout-fraction", "0.3",
+            "--steps", "3",
+            "--batch-size", "2",
+            "--out", str(out_path),
+        ])
+
+    assert out_path.exists(), "le rapport partiel aurait dû être écrit avant l'interruption"
+    report = json.loads(out_path.read_text())
+    assert len(report["architectures"]) == 1
+    assert report["architectures"][0]["channels"] == 8
+
+
 def test_main_report_includes_baseline_metrics_before_training(tmp_path):
     report = _run_tiny_main(tmp_path, out_name="report-baseline.json", seed="11")
     for entry in report["architectures"]:

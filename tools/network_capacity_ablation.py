@@ -263,6 +263,7 @@ def main(argv=None):
         return  # parser.error() appelle sys.exit ; inatteignable, garde le flux explicite
 
     epochs_equivalent = args.steps * args.batch_size / len(train_examples)
+    out_path = Path(args.out)
 
     results = []
     print(f"{'channels':>8} {'blocks':>6} {'params':>10} {'baseline_vsm':>12} "
@@ -296,28 +297,32 @@ def main(argv=None):
               f"{metrics['policy_loss']:>12.4f} {metrics['value_loss']:>11.4f} "
               f"{metrics['value_sign_match_rate']:>16.3f}", flush=True)
 
-    report = {
-        "games_dir": str(args.games_dir),
-        "seed": args.seed,
-        "steps": args.steps,
-        "batch_size": args.batch_size,
-        "max_train_positions": args.max_train_positions,
-        "max_holdout_positions": args.max_holdout_positions,
-        "holdout_fraction": args.holdout_fraction,
-        "train_file_count": len(train_files),
-        "holdout_file_count": len(holdout_files),
-        "train_pool_size": len(train_examples),
-        "holdout_pool_size": len(holdout_examples),
-        "train_value_balance": _value_balance(train_examples),
-        "holdout_value_balance": _value_balance(holdout_examples),
-        "epochs_equivalent": epochs_equivalent,
-        "architectures": results,
-    }
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(_sanitize_for_json(report), indent=2))
-    os.replace(tmp_path, out_path)
+        # Écrit le rapport après CHAQUE architecture, pas seulement à la
+        # fin de la boucle : une interruption (SIGTERM, Ctrl-C) pendant
+        # l'entraînement d'une architecture ne perd alors que celle en
+        # cours, jamais les architectures déjà terminées — même garantie
+        # d'écriture atomique (.tmp + os.replace) à chaque fois.
+        report = {
+            "games_dir": str(args.games_dir),
+            "seed": args.seed,
+            "steps": args.steps,
+            "batch_size": args.batch_size,
+            "max_train_positions": args.max_train_positions,
+            "max_holdout_positions": args.max_holdout_positions,
+            "holdout_fraction": args.holdout_fraction,
+            "train_file_count": len(train_files),
+            "holdout_file_count": len(holdout_files),
+            "train_pool_size": len(train_examples),
+            "holdout_pool_size": len(holdout_examples),
+            "train_value_balance": _value_balance(train_examples),
+            "holdout_value_balance": _value_balance(holdout_examples),
+            "epochs_equivalent": epochs_equivalent,
+            "architectures": results,
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(_sanitize_for_json(report), indent=2))
+        os.replace(tmp_path, out_path)
 
 
 if __name__ == "__main__":
