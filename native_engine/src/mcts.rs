@@ -248,26 +248,13 @@ impl Mcts {
             noise.len(),
             "le bruit doit avoir une valeur par coup légal à la racine"
         );
-        // Les priors stockés dans `Edge::prior` sont les logits bruts
-        // renvoyés par `LeafEvaluator::evaluate` (cf. `expand_leaf`), pas
-        // une distribution de probabilité : un réseau non entraîné les
-        // renvoie centrés sur 0, ~moitié négatifs (mesuré en revue finale).
-        // `noise` (sortie de `dirichlet_noise`, bin/selfplay_worker.rs) est
-        // en revanche une vraie distribution sommant à 1. Mélanger les deux
-        // tels quels n'a aucune sémantique de probabilité et rend `epsilon`
-        // sans effet mesurable dès que l'échelle des logits dépasse celle du
-        // bruit — exactement le bruit "inerte" que ce mélange est censé
-        // éviter. Softmaxer les priors ici, juste avant le mélange, leur
-        // donne la même échelle que `noise` sans toucher à `run_single_move`
-        // (chemin d'arbitrage, qui n'appelle jamais `mix_root_noise`).
-        let max = node.edges.iter().map(|e| e.prior).fold(f32::NEG_INFINITY, f32::max);
-        let mut total = 0.0f32;
-        for edge in node.edges.iter_mut() {
-            edge.prior = (edge.prior - max).exp();
-            total += edge.prior;
-        }
+        // `Edge::prior` est déjà une distribution de probabilité à ce stade
+        // (normalisée par `expand_leaf`, qui normalise désormais tout nœud,
+        // pas seulement la racine) ; `noise` (sortie de `dirichlet_noise`,
+        // bin/selfplay_worker.rs) en est une aussi — les mélanger directement
+        // a un sens de probabilité correct, sans re-softmaxer.
         for (edge, &n) in node.edges.iter_mut().zip(noise) {
-            edge.prior = (edge.prior / total) * (1.0 - epsilon) + n * epsilon;
+            edge.prior = edge.prior * (1.0 - epsilon) + n * epsilon;
         }
     }
 
@@ -313,12 +300,13 @@ impl Mcts {
 
     /// Crée le noeud d'une feuille nouvellement évaluée : une arête par
     /// coup légal, avec son prior tiré de `priors` à l'index
-    /// `action_index`. Ne fait aucun backup — appelé juste avant
-    /// `backup_path` par `run`/`ensure_root_expanded`.
+    /// `action_index`, normalisé en distribution de probabilité. Ne fait
+    /// aucun backup — appelé juste avant `backup_path` par
+    /// `run`/`ensure_root_expanded`.
     fn expand_leaf(&mut self, state: State, priors: &[f32]) {
         let to_move = state.player;
         let children = legal_children(&state);
-        let edges = children
+        let mut edges: Vec<Edge> = children
             .into_iter()
             .map(|(mv, bld, after)| {
                 let worker_slot = state.workers[to_move as usize]
@@ -329,6 +317,29 @@ impl Mcts {
                 Edge { mv, bld, after, prior: priors[idx], visits: 0, value_sum: 0.0, virtual_loss: 0 }
             })
             .collect();
+        // `priors` sont les logits bruts renvoyés par `LeafEvaluator::evaluate`
+        // (cf. le contrat du trait) — pas une distribution de probabilité : un
+        // réseau non entraîné les renvoie centrés sur 0, ~moitié négatifs
+        // (mesuré en revue finale). `select_one` (PUCT) utilise `prior` comme
+        // P(s,a) dans son terme d'exploration et suppose une vraie
+        // distribution de probabilité sur les coups légaux de CE nœud ; sans
+        // ce softmax, un prior négatif supprime activement l'exploration d'un
+        // coup, et un prior à l'échelle de logits arbitraire peut écraser le
+        // terme Q borné [-1,1] (ou l'inverse). Normalisé ici pour tout nœud —
+        // racine et non-racine, en self-play et en arbitrage — alors que
+        // l'ancienne normalisation (dans `mix_root_noise`) ne touchait que la
+        // racine en self-play, laissant chaque autre nœud (et la racine de
+        // `run_single_move`, qui n'appelle jamais `mix_root_noise`) tourner
+        // sur des logits bruts non normalisés.
+        let max = edges.iter().map(|e| e.prior).fold(f32::NEG_INFINITY, f32::max);
+        let mut total = 0.0f32;
+        for edge in edges.iter_mut() {
+            edge.prior = (edge.prior - max).exp();
+            total += edge.prior;
+        }
+        for edge in edges.iter_mut() {
+            edge.prior /= total;
+        }
         self.nodes.insert(state, Node { edges });
     }
 
@@ -587,6 +598,36 @@ mod mcts_tree_tests {
     }
 
     #[test]
+    fn expand_leaf_normalizes_raw_logit_priors_into_a_probability_distribution() {
+        // Pin de la correction du bug trouvé lors de cette investigation :
+        // `expand_leaf` doit transformer les logits bruts de
+        // `RawLogitEvaluator` (certains négatifs, aucune contrainte de somme)
+        // en une vraie distribution de probabilité sur CHAQUE nœud qu'il
+        // crée — pas seulement la racine (c'était l'ancien comportement,
+        // via `mix_root_noise`, qui ne touchait jamais `run_single_move` ni
+        // aucun nœud non-racine).
+        let mut s = default_state();
+        s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
+        let mut mcts = Mcts::new(s, 1.5);
+        let mut eval = RawLogitEvaluator;
+        // Assez de simulations pour forcer l'expansion d'au moins un nœud
+        // non-racine, pas seulement la racine elle-même.
+        mcts.run(50, 1, &mut eval);
+        assert!(mcts.nodes.len() > 1, "au moins un nœud non-racine doit avoir été exploré");
+        for node in mcts.nodes.values() {
+            assert!(!node.edges.is_empty());
+            let sum: f32 = node.edges.iter().map(|e| e.prior).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "les priors d'un nœud doivent sommer à 1.0, trouvé {sum}"
+            );
+            for e in &node.edges {
+                assert!(e.prior >= 0.0, "un prior normalisé ne peut pas être négatif, trouvé {}", e.prior);
+            }
+        }
+    }
+
+    #[test]
     fn mix_root_noise_still_biases_toward_the_noised_edge_with_raw_logit_scale_priors() {
         let mut s = default_state();
         s.workers = [[12, 13, -1, -1], [0, 1, -1, -1]];
@@ -597,9 +638,9 @@ mod mcts_tree_tests {
         assert!(n_edges > 1, "fixture doit offrir plusieurs coups légaux pour que le test ait un sens");
         let mut noise = vec![0.0f32; n_edges];
         // L'arête 0 reçoit le prior brut le plus négatif (((0 % 5) as f32 -
-        // 2.0) * 0.75 == -1.5) : sans normalisation, mélanger du bruit à
-        // epsilon=0.25 ne suffit pas à la sortir de son déficit de prior, et
-        // elle reste activement repoussée par le terme d'exploration UCB.
+        // 2.0) * 0.75 == -1.5) : même après normalisation par `expand_leaf`,
+        // c'est la plus petite probabilité du lot, donc le mélange à
+        // epsilon=0.25 doit encore suffire à la faire ressortir.
         noise[0] = 1.0;
         mcts.mix_root_noise(&noise, 0.25); // DIRICHLET_EPSILON (bin/selfplay_worker.rs)
         mcts.run(400, 1, &mut eval);
