@@ -197,12 +197,30 @@ class Trainer:
                       for path in self.checkpoint_dir.glob("gen-*.pt")
                       for generation in [checkpoint_generation(path)]
                       if generation is not None]
-        if candidates:
-            latest = max(candidates, key=lambda item: item[0])[1]
-            data = torch.load(latest, weights_only=False)
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        unreadable = []
+        for generation, path in candidates:
+            try:
+                data = torch.load(path, weights_only=False)
+            except Exception:
+                # Même risque que les fichiers de parties (cf.
+                # `consume_new_games`) : `save_checkpoint` n'appelle pas
+                # fsync avant son renommage atomique, donc une coupure de
+                # courant peut laisser un `.pt` final mais tronqué/invalide.
+                # Retente le checkpoint juste plus ancien au lieu de planter
+                # toute la reprise sur le seul fichier le plus récent.
+                unreadable.append(path)
+                continue
             self.net.load_state_dict(data["model_state"])
             self.optimizer.load_state_dict(data["optimizer_state"])
             self.generation = data["generation"]
+            break
+        else:
+            if candidates:
+                raise RuntimeError(
+                    f"aucun des {len(candidates)} checkpoint(s) n'a pu être chargé "
+                    f"(tous corrompus ?) : {[str(p) for p in unreadable]}"
+                )
         # Le tampon n'est jamais sérialisé dans le checkpoint (voir
         # `_rebuild_buffer_from_disk`) : il se reconstruit toujours depuis
         # les fichiers de parties sur disque, qu'un checkpoint modèle ait

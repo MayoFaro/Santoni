@@ -217,6 +217,44 @@ def test_load_latest_checkpoint_selects_the_highest_generation_numerically(tmp_p
     assert resumed.load_latest_checkpoint() == 10001
 
 
+def test_load_latest_checkpoint_falls_back_to_an_older_checkpoint_when_the_newest_is_corrupted(tmp_path):
+    """`save_checkpoint` n'appelle pas fsync avant son renommage atomique
+    (même risque que `mcts_io::write_game_atomically` pour les fichiers de
+    parties) : une coupure de courant peut laisser un `gen-N.pt` final mais
+    tronqué/invalide. La reprise ne doit pas planter sur ce seul fichier --
+    elle doit retomber sur le checkpoint juste plus ancien, toujours valide
+    grâce à `CHECKPOINT_RETENTION`."""
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    write_fake_game(games_dir, "game-0000.json", 1, [(PLACEHOLDER_PLANES, [[10, 20]])])
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    trainer.consume_new_games()
+    trainer.train_step(batch_size=1)
+    older = trainer.save_checkpoint()
+    assert Path(older).name == "gen-0001.pt"
+    newer = trainer.save_checkpoint()
+    assert Path(newer).name == "gen-0002.pt"
+
+    Path(newer).write_bytes(b"tronque par une coupure de courant")
+
+    resumed = Trainer(str(games_dir), str(checkpoint_dir))
+    assert resumed.load_latest_checkpoint() == 1
+    assert resumed.net.state_dict().keys() == trainer.net.state_dict().keys()
+
+
+def test_load_latest_checkpoint_raises_when_every_checkpoint_is_corrupted(tmp_path):
+    """Si TOUS les checkpoints sont illisibles, la reprise doit échouer
+    bruyamment plutôt que de silencieusement repartir d'un réseau non
+    entraîné sous le nom d'une génération déjà avancée."""
+    games_dir, checkpoint_dir = make_dirs(tmp_path)
+    (checkpoint_dir / "gen-0001.pt").write_bytes(b"corrompu")
+    (checkpoint_dir / "gen-0002.pt").write_bytes(b"corrompu aussi")
+
+    trainer = Trainer(str(games_dir), str(checkpoint_dir))
+    with pytest.raises(RuntimeError):
+        trainer.load_latest_checkpoint()
+
+
 def test_save_checkpoint_prunes_all_but_the_retained_newest(tmp_path):
     """Rien ne supprimait les anciens checkpoints : `save_checkpoint` ne doit
     laisser que les `CHECKPOINT_RETENTION` générations les plus récentes,
